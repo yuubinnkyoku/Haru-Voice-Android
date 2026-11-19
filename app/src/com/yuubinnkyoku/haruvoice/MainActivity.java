@@ -247,7 +247,7 @@ public class MainActivity extends Activity {
         runOnUiThread(new Runnable() {
             @Override public void run() {
                 logBuf.append(line).append('\n');
-                // 上限: 50万文字で頭を削る
+                // 上限: 40万文字で頭を削る
                 if (logBuf.length() > 500000) logBuf.delete(0, logBuf.length() - 400000);
 
                 ScrollView sv = logScroll;
