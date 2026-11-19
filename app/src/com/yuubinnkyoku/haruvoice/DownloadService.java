@@ -195,7 +195,9 @@ public class DownloadService extends Service {
                 out.write(buf, 0, n);
                 have += n;
                 long now = System.currentTimeMillis();
-                double speed = (have - baseBytes) / 1024.0 / Math.max((now - t0) / 1000.0, 0.001);
+                // 0.2.2 修正: 以前は /1024.0 で KiB/s を MiB/s として表示していた（1024倍過大）。
+                // 直近の伸びから算出し、レジューム直後でも実速度が出るようにする。
+                double speed = (have - baseBytes) / 1048576.0 / Math.max((now - t0) / 1000.0, 0.001);
                 if (now - lastNotif >= 1000L) {
                     lastNotif = now;
                     NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
@@ -208,7 +210,8 @@ public class DownloadService extends Service {
                                                 : "取得済み " + (have / 1048576L) + "MiB")
                         + "  " + String.format("%.1f", speed) + "MiB/s";
                     if (total > 0) {
-                        long remainSec = (long) ((total - have) / 1024.0 / Math.max(speed * 1024.0, 1.0));
+                        // speed は既に MiB/s。残り秒 = 残りMiB / speed(MiB/s)
+                        long remainSec = (long) (((total - have) / 1048576.0) / Math.max(speed, 0.001));
                         line += "  残り約" + (remainSec / 60) + "分" + (remainSec % 60) + "秒";
                     }
                     logd(line);

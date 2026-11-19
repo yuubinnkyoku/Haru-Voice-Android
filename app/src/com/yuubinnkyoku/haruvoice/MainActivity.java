@@ -113,8 +113,14 @@ public class MainActivity extends Activity {
         f.addAction(DownloadService.ACTION_LOG);
         f.addAction(DownloadService.ACTION_STATE);
         registerReceiver(receiver, f);
-        if (DownloadService.instance != null && DownloadService.instance.running) btnDl.setText("DLを中断");
-        else btnDl.setText("モデルDL開始");
+        // 0.2.2 修正: 画面が前面にない間に開始した場合 STATE_RUNNING を取りこぼし、
+        // 「準備完了」のまま残っていた。実際の稼働状態から復元する。
+        if (DownloadService.instance != null && DownloadService.instance.running) {
+            btnDl.setText("DLを中断");
+            status("DL実行中。アプリを閉じても通知とともに継続します");
+        } else {
+            btnDl.setText("モデルDL開始");
+        }
     }
 
     @Override
