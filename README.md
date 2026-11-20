@@ -9,6 +9,7 @@
 - `app/` … APK の全ソース（MainActivity.java / DownloadService.java / AndroidManifest.xml）
 - `build/BUILD-RECIPE.md` … ゼロから APK を作る完全レシピ（ツールチェーン取得・bionic パッチ・OOM 回避・署名まで）
 - `docs/USAGE.md` … インストール手順と使い方
+- `docs/NPU-GPU-FINDINGS.md` … NPU (Hexagon) と GPU (OpenCL / Vulkan) を実機で試した記録
 - `signing/` … v0.2.2 以降の統一署名鍵（base64）
 
 ## 現行バージョン: HaruVoice 0.2.5（versionCode 7）
@@ -57,3 +58,7 @@ base64 -d signing/HaruVoice-signing-key.jks.b64 > HaruVoice-signing-key.jks
 - F16 量子化モデルは ARM CPU でオーバーフロー停止するため使用禁止。Q8_0（推奨）か Q6_K を使う。
 - APK バイナリは当面 artifacts で配布。GitHub Releases への格納は追って実施する。
 - 実機: nubia NX741J（Snapdragon 8 Elite Gen 5、Android 36、16GB）で動かす前提。
+- **NPU と GPU は使えない。** Hexagon NPU は非 root の user ビルドでは `/dev/fastrpc-cdsp` を開けず
+  `libcdsprpc.so` もロードできない。Adreno GPU は Vulkan なら 1.26 倍速いが生成音声が飽和して壊れ、
+  OpenCL は `CONV_2D_DW` 未実装で動かない。CPU 実行のままが正解。詳細は
+  `docs/NPU-GPU-FINDINGS.md`。
