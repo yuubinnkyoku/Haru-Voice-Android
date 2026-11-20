@@ -45,6 +45,8 @@ public class DownloadService extends Service {
         "c372a527e63ca4251429a48863535b8bca03ebd6f414bbf31f28a9d175349934",
         "8db05e86acca046bc183d4e30fbda22ac775ba4767ae5a10bcd0d48f8d7db793"
     };
+    // 0.2.5: 既存モデルの判定に使う想定サイズ（サーバーに問い合わせずに済ませる）
+    static final long[] SIZES = { 6623102720L, 5605707520L };
 
     private static final int NOTIF_ID = 42;
     private static final int RESULT_ID = 43;
@@ -55,6 +57,34 @@ public class DownloadService extends Service {
     public volatile boolean running = false;
     private Thread worker = null;
     private PowerManager.WakeLock wakeLock;
+
+    // 0.2.5: 画面が前面にない間（Activity の onPause 中）は受信側が居らず
+    // ブロードキャストが捨てられ、ログに穴が空けていた。プロセス内に履歴を残して
+    // onResume で復元する。seq は通し番号で、履歴が先頭から捨てられても差分が取れる。
+    static final java.util.ArrayList<String> LOG_HISTORY = new java.util.ArrayList<String>();
+    static final int LOG_HISTORY_MAX = 4000;
+    static long logSeq = 0L;
+
+    static void pushHistory(String line) {
+        synchronized (LOG_HISTORY) {
+            LOG_HISTORY.add(line);
+            logSeq++;
+            while (LOG_HISTORY.size() > LOG_HISTORY_MAX) LOG_HISTORY.remove(0);
+        }
+    }
+
+    /** seq 以降の行を返す。戻り値[0] は「次に要求すべき seq」 */
+    static Object[] historySince(long since) {
+        synchronized (LOG_HISTORY) {
+            long firstSeq = logSeq - LOG_HISTORY.size() + 1; // 履歴先頭の通し番号
+            long from = Math.max(since, firstSeq);
+            int idx = (int) (from - firstSeq);
+            if (idx < 0) idx = 0;
+            if (idx > LOG_HISTORY.size()) idx = LOG_HISTORY.size();
+            String[] out = LOG_HISTORY.subList(idx, LOG_HISTORY.size()).toArray(new String[0]);
+            return new Object[] { out, Long.valueOf(logSeq + 1) };
+        }
+    }
 
     @Override
     public void onCreate() {
@@ -124,10 +154,22 @@ public class DownloadService extends Service {
         if (destDir == null) destDir = getFilesDir();
         destDir.mkdirs();
         File part = new File(destDir, name + ".part");
+        File dest = new File(destDir, name);
 
         logd("対象: " + name + " (" + (q == 0 ? "6.6GB・推奨" : "5.6GB・メモリ節約") + ")");
         logd("URL: " + url);
         logd("保存先: " + destDir.getAbsolutePath());
+
+        // 0.2.5 修正: 完成済みモデルがあるのに「モデルDL開始」を押すと .part が無いため
+        // have=0 になり、6.6GB を最初から取り直していた（完成ファイルは最後まで残るので
+        // 一見「100%から0%に戻った」ように見える）。サイズ一致なら DL をスキップする。
+        if (dest.exists() && dest.length() == SIZES[q]) {
+            logd("既にダウンロード済みです (" + (dest.length() / 1048576L) + "MiB)。DLをスキップします");
+            logd("再取得したい場合はファイルを削除してから実行してください: " + dest.getAbsolutePath());
+            sendState(STATE_DONE, dest.getAbsolutePath());
+            notifyResult(android.R.drawable.stat_sys_download_done, "モデルDL済み", name + " は取得済みです");
+            return;
+        }
 
         long have = part.exists() ? part.length() : 0L;
         if (have > 0) logd("既存の .part から再開: " + (have / 1048576L) + "MiB");
@@ -141,7 +183,7 @@ public class DownloadService extends Service {
             conn.setInstanceFollowRedirects(true);
             conn.setConnectTimeout(20000);
             conn.setReadTimeout(30000);
-            conn.setRequestProperty("User-Agent", "HaruVoice/0.2.2 (android)");
+            conn.setRequestProperty("User-Agent", "HaruVoice/" + versionName() + " (android)");
             if (have > 0) conn.setRequestProperty("Range", "bytes=" + have + "-");
             conn.connect();
             int code = conn.getResponseCode();
@@ -232,21 +274,21 @@ public class DownloadService extends Service {
                 notifyResult(android.R.drawable.stat_notify_error, "DL失敗", name + " sha256不一致のため破棄");
                 return;
             }
-            File dest = new File(destDir, name);
-            if (dest.exists()) dest.delete();
-            boolean ok = part.renameTo(dest);
+            File dest2 = new File(destDir, name);
+            if (dest2.exists()) dest2.delete();
+            boolean ok = part.renameTo(dest2);
             if (!ok) {
                 FileInputStream fi = new FileInputStream(part);
-                FileOutputStream fo = new FileOutputStream(dest);
+                FileOutputStream fo = new FileOutputStream(dest2);
                 byte[] c = new byte[65536];
                 int r;
                 while ((r = fi.read(c)) > 0) fo.write(c, 0, r);
                 fi.close(); fo.close();
                 part.delete();
             }
-            logd("sha256 OK。保存完了: " + dest.getAbsolutePath());
-            sendState(STATE_DONE, dest.getAbsolutePath());
-            notifyResult(android.R.drawable.stat_sys_download_done, "モデルDL完了", dest.getName() + " (sha256検証済み)");
+            logd("sha256 OK。保存完了: " + dest2.getAbsolutePath());
+            sendState(STATE_DONE, dest2.getAbsolutePath());
+            notifyResult(android.R.drawable.stat_sys_download_done, "モデルDL完了", dest2.getName() + " (sha256検証済み)");
         } finally {
             try { if (out != null) out.close(); } catch (Exception e) { /* */ }
             try { if (in != null) in.close(); } catch (Exception e) { /* */ }
@@ -255,6 +297,14 @@ public class DownloadService extends Service {
     }
 
     // ---------- helpers ----------
+
+    private String versionName() {
+        try {
+            return getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
+        } catch (Exception e) {
+            return "?";
+        }
+    }
 
     private int pct(long have, long total) { return (int) Math.min(100, have * 100 / total); }
 
@@ -299,6 +349,7 @@ public class DownloadService extends Service {
     }
 
     private void logd(String line) {
+        pushHistory(line);
         Intent i = new Intent(ACTION_LOG).setPackage(getPackageName());
         i.putExtra(EXTRA_LINE, line);
         sendBroadcast(i);

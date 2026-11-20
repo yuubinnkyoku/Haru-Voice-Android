@@ -47,13 +47,16 @@ public class MainActivity extends Activity {
     Process proc = null;
     MediaPlayer player = null;
     File replyFile;
+    long logSeqShown = 1L;    // DLログ履歴のどこまで表示したか
 
     final BroadcastReceiver receiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
             String action = intent.getAction();
             if (DownloadService.ACTION_LOG.equals(action)) {
-                appendLog(intent.getStringExtra(DownloadService.EXTRA_LINE));
+                // 0.2.5: 行を直接追記せず履歴経由で取り込む。ブロードキャストと
+                // onResume の復元が二重に走っても重複しない。
+                restoreLogHistory();
             } else if (DownloadService.ACTION_STATE.equals(action)) {
                 int st = intent.getIntExtra(DownloadService.EXTRA_STATE, -1);
                 String path = intent.getStringExtra(DownloadService.EXTRA_PATH);
@@ -92,7 +95,7 @@ public class MainActivity extends Activity {
 
         buildUi();
 
-        appendLog("HaruVoice 0.2.2 (speech.cpp 0.11.0 / Haru-4B)");
+        appendLog("HaruVoice " + appVersion() + " (speech.cpp 0.11.0 / Haru-4B)");
         appendLog("native: " + nativeLibDir.getAbsolutePath());
         appendLog("work:   " + workDir.getAbsolutePath());
         appendLog("speech: " + (speechBin.exists() ? "OK" : "見つからない!") + "  timing: " + (timingBin.exists() ? "OK" : "見つからない!"));
@@ -121,6 +124,17 @@ public class MainActivity extends Activity {
         } else {
             btnDl.setText("モデルDL開始");
         }
+        // 0.2.5 修正: onPause 中は受信側が居らずブロードキャストが捨てられるため、
+        // 戻ってきたときにログの穴を埋める。
+        restoreLogHistory();
+    }
+
+    /** プロセス内に残した DL ログ履歴を、まだ表示していない分だけ追記する */
+    void restoreLogHistory() {
+        Object[] r = DownloadService.historySince(logSeqShown);
+        String[] lines = (String[]) r[0];
+        logSeqShown = ((Long) r[1]).longValue();
+        for (String s : lines) appendLog(s);
     }
 
     @Override
@@ -131,6 +145,15 @@ public class MainActivity extends Activity {
 
     // ================= UI =================
 
+    /** バージョン表記をハードコードせず PackageManager から取る（更新時にズレない） */
+    String appVersion() {
+        try {
+            return getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
+        } catch (Exception e) {
+            return "?";
+        }
+    }
+
     void buildUi() {
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
@@ -139,7 +162,7 @@ public class MainActivity extends Activity {
         root.setPadding(pad, pad, pad, pad);
 
         TextView title = new TextView(this);
-        title.setText("Haru音声対話 0.2.2");
+        title.setText("Haru音声対話 " + appVersion());
         title.setTextColor(Color.WHITE);
         title.setTextSize(18);
         root.addView(title);

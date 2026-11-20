@@ -45,11 +45,16 @@ ninja -C build-android-cpu speech-cli haru-timing
 
 ```sh
 javac --release 8 -encoding UTF-8 -classpath $SDK/platforms/android-34/android.jar -d obj src/com/yuubinnkyoku/haruvoice/*.java
-$BT/d8 --release --min-api 26 --lib $SDK/platforms/android-34/android.jar --output dexout obj/com/yuubinnkyoku/haruvoice/*.class
+$BT/d8 --release --min-api 26 --lib $SDK/platforms/android-34/android.jar --output dexout $(find obj -name '*.class')
 $BT/aapt2 link -I $SDK/platforms/android-34/android.jar --manifest AndroidManifest.xml \
-  -o base.apk --min-sdk-version 26 --target-sdk-version 28 --version-code 4 --version-name 0.2.2
+  -o base.apk --min-sdk-version 26 --target-sdk-version 28 --version-code 7 --version-name 0.2.5
 ```
 
+- **d8 には `obj` 配下の `.class` を全て渡す。** トップレベルの 2 ファイルだけ渡すと
+  匿名内部クラス（`MainActivity$1` など 15 個）が dex に入らず、起動直後に
+  `NoClassDefFoundError: Failed resolution of: Lcom/yuubinnkyoku/haruvoice/MainActivity$1;`
+  でクラッシュする。PowerShell は glob を展開しないので `Get-ChildItem -Recurse -Filter *.class`
+  で明示的に列挙すること。
 - **d8 は JDK 17 で動かす。** JDK 25 の javac が出す class ファイルだと
   `NullPointerException: Cannot invoke "String.length()" because "<parameter1>" is null`
   で d8 が内部エラーになる。`JAVA_HOME` を JDK 17 に向けてから javac と d8 の両方を実行する。
@@ -67,14 +72,20 @@ $BT/apksigner verify --print-certs HaruVoice-0.2.2.apk
 署名後は必ず `apksigner verify --print-certs` の証明書 SHA-256 が
 `545885c1e7d9de52c8162a80b79ecbd1514ebc41795d0ce0de82948c028ec681` と一致することを確認する。
 
-## v0.2.2 の sha256
+## v0.2.5 の sha256
 
-- APK: `d1eb9cd96957cd9e55721f8c8a876f56bc33e94a3755ed03aba7baf59c947661`（2026-11-20 再ビルド・新鍵）
+- APK: `200d07cd65d3733174a0646b52180aa587d6b4904c0f4cfd3127cd922f5cf996`
 - libspeech-cli.so: `d7df1550c835d90b87e963f0f731cc1fccfc8533ff6696e0329fb5e59af01edb`
 - libharu-timing.so: `735b8b5a443476a6c1ddd660f94e260b3a67493bf26952545fb178f92b576319`
 - libomp.so: `8d9fb977184d7a4bffd85cdd6ebb07db06a451dac6e425b47ec8ecd8d35c3a7c`
 - モデル Q8_0: `c372a527e63ca4251429a48863535b8bca03ebd6f414bbf31f28a9d175349934`（6.62GB）
 - モデル Q6_K: `8db05e86acca046bc183d4e30fbda22ac775ba4767ae5a10bcd0d48f8d7db793`（5.61GB）
+
+## 過去バージョンの sha256
+
+- 0.2.2 APK: `d1eb9cd96957cd9e55721f8c8a876f56bc33e94a3755ed03aba7baf59c947661`
+- 0.2.3 APK: `07396cf52f754a3fb89842eed67f3a940d37086064d6dc5d52acc0ff2ab7d162`
+- 0.2.4 APK: `073086e1bd13f275ebd8d35c9c424f693cdafd5fcdeffbadb82c5c9b28f4befa`
 
 > 旧 APK sha256 `e9402618f34e2c0f52905b3d69ffd8020e8c985573ef4e7d049b9d148228790b` は
 > 旧鍵で署名した 0.2.2 のもの。鍵再生成に伴い再ビルドしたため値が変わった。
