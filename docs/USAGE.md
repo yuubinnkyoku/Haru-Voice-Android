@@ -1,14 +1,14 @@
-# HaruVoice の使い方（v0.2.2）
+# HaruVoice の使い方（v0.2.5）
 
-Haru-4B を端末単体で動かすアプリ。ADB 経由でインストールする。実機での起動・DL は 0.2.2 の時点では未検証（0.2.1 は実機起動済み）。
+Haru-4B を端末単体で動かすアプリ。ADB 経由でインストールする。実機（nubia NX741J）で 6.6GB の Q8_0 を完走・sha256 検証済み、talk による返答生成も動作確認済み。
 
 ## 1. インストール
 
-v0.2.0 / v0.2.1 を入れたことがあるなら先にアンインストール（署名が変わっているためアップデート不可）。以後のバージョンは署名を統一しているので `adb install -r` で更新できる。
+v0.2.0 / v0.2.1 を入れたことがあるなら先にアンインストール（署名が変わっているためアップデート不可）。0.2.2 以降は署名を統一しているので `adb install -r` で更新できる。
 
 ```sh
-adb uninstall com.yuubinnkyoku.haruvoice   # 旧版がある場合のみ
-adb install HaruVoice-0.2.2.apk
+adb uninstall com.yuubinnkyoku.haruvoice   # 0.2.1 以前がある場合のみ
+adb install -r HaruVoice-0.2.5.apk
 ```
 
 ## 2. モデルDL（アプリ内）
@@ -20,18 +20,50 @@ adb install HaruVoice-0.2.2.apk
 
 モバイルデータ回線では 1 回目のタップで警告して止まり、2 回目のタップで開始する。
 
-## 3. 返答を作る
+> **0.2.5 以降**: 既に完成済みのモデルがある状態で「モデルDL開始」を押しても、再ダウンロードはせずスキップする。取り直したいときはファイルを削除してから実行する。
 
-1. 質問音声（wav、16k/24k モノラル）をアプリの作業ディレクトリ（`Android/data/com.yuubinnkyoku.haruvoice/files`）か `Download/HaruVoice/` に置く
-2. 名前・persona を適宜編集（任意の参照ボイス wav も指定可）
-3. 「返答を作る」をタップ。完了したら「返答を再生」
+## 3. 質問音声を用意する
 
-## 4. 速度実測
+talk には**質問音声の wav** が必要。アプリは起動時に `question.wav` を自動検出する。
+
+- 形式: **16kHz または 24kHz / モノラル / 16bit PCM**
+- 置き場所: `Android/data/com.yuubinnkyoku.haruvoice/files/`（推奨）または `Download/HaruVoice/`
+- ファイル名は任意。絶対パスを直接入力してもよい
+
+### 音声が手元に無い場合（Windows の TTS で作る）
+
+```powershell
+Add-Type -AssemblyName System.Speech
+$s = New-Object System.Speech.Synthesis.SpeechSynthesizer
+$s.SelectVoice("Microsoft Haruka Desktop")   # 日本語音声
+$fmt = New-Object System.Speech.AudioFormat.SpeechAudioFormatInfo(
+    16000,
+    [System.Speech.AudioFormat.AudioBitsPerSample]::Sixteen,
+    [System.Speech.AudioFormat.AudioChannel]::Mono)
+$s.SetOutputToWaveFile("question.wav", $fmt)
+$s.Speak("こんにちは。今日はいい天気ですね。何をして過ごすのが好きですか。")
+$s.Dispose()
+```
+
+```sh
+adb push question.wav /sdcard/Android/data/com.yuubinnkyoku.haruvoice/files/question.wav
+```
+
+端末で録音する場合は 16kHz モノラルで保存できるアプリを使う。
+
+## 4. 返答を作る
+
+1. 名前・persona を適宜編集（任意の参照ボイス wav も指定可）
+2. 「返答を作る」をタップ。モデルのロードに約 8 秒、生成は音声 6.4 秒分で約 22 秒（RTFx 0.30）
+3. 完了したら「返答を再生」。`reply.wav`（24kHz モノラル）が作業ディレクトリに出力される
+
+## 5. 速度実測
 
 「速度を実測」で haru-timing 3 runs。step 時間の p50 がログに出るので、今後の高速化判定の資料に使う。
 
 ## トラブルシュート
 
-- DL が始まらない: ログを確認。古い v0.2.1 は Content-Length の int 不具合で総サイズが取れない（6.6GB が 2GB を超えるため）。0.2.2 で修正済み。
+- **「エラー: 質問音声が見つかりません」** … `question.wav` が所定の場所に無い、または拡張子・形式が違う。16kHz/24kHz モノラルの wav を置く。
+- DL が始まらない: ログを確認。v0.2.1 は Content-Length の int 不具合で総サイズが取れない（6.6GB が 2GB を超えるため）。0.2.2 で修正済み。
 - talk が終わらない: speech.cpp の talk は入力の無音が長いと 1 秒以上の遅延で stop 扱いになる設計。「停止」で止めて短めの wav で試す。
-- モデル検出されない: 再DL後にビルド番号を上げた場合（未実装）
+- モデル検出されない: ファイルサイズが 1GB 未満だと検出対象外。
