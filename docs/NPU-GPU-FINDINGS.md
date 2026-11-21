@@ -271,6 +271,72 @@ if (kparams.n_hmx && src0->ne[0] % 32 != 0) return false;
 `haru-timing` は codec を直接呼ぶので `CONV_2D_DW` に当たり abort する。
 Phase B の速度は `talk` の `computed in` で判断するしかない。
 
+### 1.10 第3ラウンド: NaN の出所を特定
+
+第2ラウンドで「HVX のみでも NaN が出る」と記録したが、その出所を op 単位で追った。
+
+#### 計測方法
+
+`Dialogue::emit()` に `SPEECH_NAN_TRACE` のフックを足し、グラフの 4 つの結果
+（`hidden` / `logits` / `silent` / `latent`）それぞれが有限かを 1 フレームごとに出す。
+
+#### 結果: NaN は `latent` だけに出る
+
+```
+nan-trace: hidden ok logits ok silent ok latent ok
+nan-trace: hidden ok logits ok silent ok latent ok
+nan-trace: hidden ok logits ok silent ok latent NAN   ← ここで API が停止
+```
+
+- `hidden`（LM の最終隠れ状態）は常に有限
+- `logits` / `silent`（LM の出力射影）も常に有限
+- **`latent`（head の出力）だけが NaN になる**
+
+つまり **LM の計算は正しく、head のグラフだけが壊れている。** 5 回中 3 回の頻度で出る。
+
+#### 切り分け: head を CPU に固定すると NaN が消える
+
+`haru::tensor_on_cpu()` に `SPEECH_HEAD_CPU` のスイッチを足し、`head.*` のテンソルを
+CPU に置いて 5 回走らせた:
+
+```
+run 1..5 : latent NAN = 0, 0, 0, 0, 0
+```
+
+**NaN は 5/5 で消えた。** 原因は head のグラフを HTP で走らせたことにある。
+
+head が使う op は `MUL_MAT` / `RMS_NORM` / `MUL` / `ADD` / `SCALE` / `SILU` / `CONT` で、
+いずれも `op_remap_to_htp()` にある。怪しいのは `part()` が作る
+`ggml_view_2d` + `ggml_cont` の組み合わせ（`head.cpp`）で、`ada` の出力
+`[3 x hidden, 1]` から 3 つの `[hidden, 1]` を切り出す。HTP の `CONT` がこの
+view オフセットを正しく扱えていない可能性がある。
+
+#### ただし head を CPU に移すと別のクラッシュが出る
+
+```
+signal 11 (SIGSEGV), fault addr 0x2538a80821601540
+  #00 ggml_hexagon_session::clone_buffer()  ggml-hexagon.cpp:4715
+  #01 enqueue_op                            ggml-hexagon.cpp:4422
+  #02 ggml_backend_hexagon_graph_compute    ggml-hexagon.cpp:8706
+```
+
+`clone_buffer()` の `sbuf->mem`（`shared_ptr`）が解放済みの状態で参照されている。
+**head を CPU に移すと HTP バッファの寿命管理が壊れる**という、hexagon バックエンド側の
+別のバグ。`GGML_ASSERT(sbuf && sbuf->mem)` を通り抜けてから落ちているので、
+`mem` の参照カウントがどこかで失われている。
+
+#### 第3ラウンドの結論
+
+| 項目 | 状態 |
+|---|---|
+| NaN の出所 | **特定済み**: head のグラフ（`latent` のみ） |
+| LM の計算 | **正しい**（`hidden` / `logits` / `silent` は常に有限） |
+| head を CPU に置く | NaN は消えるが `clone_buffer` でセグフォルト |
+| 残る作業 | (a) head の `CONT`+view が HTP で正しく動くか、 (b) `clone_buffer` の寿命バグ |
+
+**次の一手は (a) と (b) の 2 つに絞られた。** どちらも hexagon バックエンド側の修正で、
+haru 側の変更ではない。
+
 #### Phase C の前提が変わった点（重要）
 
 指示書には「幅 7 の conv は分解しても K=7 が 32 非倍数で CPU 回帰になる」とあるが、
