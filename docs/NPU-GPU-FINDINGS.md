@@ -213,19 +213,21 @@ decode: out(1,1,2048,1)   s0(7,1,1,2048) s1(7,1,2048,1)  stride(1,1) pad(0,0) di
 speech: device: the model's audio came out as numbers that are not finite; run it on another device
 ```
 
-`GGML_HEXAGON_MM_SELECT=1`（HVX のみ）にすると NaN は消え、音声も正常になる
-（peak 16641 / RMS 877 / クリップ 0）。**HMX のカーネルが haru の shape で壊れている。**
-
-**(3) HVX のみでも数値が不安定。** 同じ seed 1 で 3 回走らせると
+**(3) HVX のみでも NaN と非再現が残る。** `GGML_HEXAGON_MM_SELECT=1`（HVX のみ）にすると
+NaN の頻度は下がるが消えない。同じ seed 1 で 4 回走らせると
 
 ```
-run 1: " innehål that?  anto いい "   → 25.1 s
-run 2: NaN で停止
-run 3: " I . "                       → 25.2 s
+run 1: ""            → NaN で停止
+run 2: "い"          → NaN で停止
+run 3: ""            → NaN で停止
+run 4: ""            → NaN で停止
 ```
 
-出力が毎回変わり、NaN も出る。CPU は同じ seed で常に同じ結果（無言）を返す。
-**HTP の計算結果は再現性がなく、そのままでは使えない。**
+`GGML_HEXAGON_NDEV=1`（単一デバイス）でも 4 回中 4 回 NaN なので、**レースではない**。
+`max_seconds` を 1〜4 に振ると NaN の出方が変わる（1 と 3 は完走、2 と 4 は NaN）ので、
+フレーム数に単純比例する問題でもない。**HTP の計算結果は再現性がなく、そのままでは使えない。**
+
+CPU は同じ seed で常に同じ結果を返す。
 
 **(4) CPU より遅い。** `talk` の実測（6.40 s の音声、48 フレーム）:
 
@@ -242,21 +244,46 @@ run 3: " I . "                       → 25.2 s
 #### 副産物: `ggml-hexagon` の `supports_op` バグ
 
 `ggml_hexagon_supported_mul_mat()` が **K が 32 の倍数でない行列積を「対応」と答えていた**。
-DSP 側の `hmx_mm_nx_2d_f32()` は `if (k % 32 != 0) return HTP_STATUS_NO_SUPPORT;` で拒否するので、
-1 行ステップの attention（K=2）で
+DSP 側の HMX カーネル（`hmx_mm_2d_f32()` / `hmx_mm_f16_f32_batched()` / `hmx_mm_id_2d_f32()`）は
+`if (k % 32 != 0) return HTP_STATUS_NO_SUPPORT;` で拒否するので、1 行ステップの attention（K=2）で
 
 ```
 ggml-hex: HTP0 dspcall : dsp-rsp NO-SUPPORT
 ggml-hex: HTP0 synchronize failed : dsp-error NO-SUPPORT
 ```
 
-となりプロセスごと abort していた。`src0->ne[0] % 32 != 0` なら `false` を返すように修正した
-（`ggml-hexagon.cpp`）。これで該当ノードは scheduler が CPU に回す。
+となりプロセスごと abort していた。
+
+**修正は HMX 経路だけに絞る。** 最初 `src0->ne[0] % 32 != 0` で無条件に `false` を返すように
+したが、これは広すぎた。`k % 32` を課すのは HMX カーネルだけで、**HVX カーネルは任意の K を
+取る**（`HTP_MM_KERNEL_HVX_F32_F32_VTCM` に K の制約はない）。無条件のガードは、後述する
+depthwise conv の分解（K = カーネル幅 = 7）まで CPU に落としてしまう。最終的に
+
+```c
+if (kparams.n_hmx && src0->ne[0] % 32 != 0) return false;
+```
+
+とした（`ggml-hexagon.cpp`）。これで該当ノードは scheduler が CPU に回し、HVX で走れる
+ノードは HTP に残る。
 
 #### 副産物: `haru-timing` は NPU で走らない
 
 `haru-timing` は codec を直接呼ぶので `CONV_2D_DW` に当たり abort する。
 Phase B の速度は `talk` の `computed in` で判断するしかない。
+
+#### Phase C の前提が変わった点（重要）
+
+指示書には「幅 7 の conv は分解しても K=7 が 32 非倍数で CPU 回帰になる」とあるが、
+これは**上の無条件ガードの副作用**であって、分解式の本質的な制約ではない。
+
+- `ggml_im2col()` の出力は `ne[0] = KH*KW*IC`。depthwise をチャネルごとに分けると
+  `IC=1` なので **K = KH*KW = 7**。
+- `ggml_hexagon_precompute_im2col_params()` に K の 32 倍数要求は無い。
+- HVX の `MUL_MAT` カーネルにも K の制約は無い。
+
+したがってガードを HMX 限定にした今、**K=7 の分解は HTP で走れる**。Phase C を見送る理由は
+「K が 32 非倍数だから」ではなく、**LM 自体が遅く・NaN を出すので codec だけ速くしても
+全体が良くならない**という点に変わった。
 
 ---
 
@@ -423,17 +450,24 @@ Phase B（LM だけ HTP）を実際に走らせた結果、**Phase C に進む�
 
 - LM を HTP に載せても **CPU より 25% 遅い**（25.4 s vs 20.0 s）。1 フレーム = 1 トークンの
   逐次処理では HMX のタイルが埋まらず、転送とカーネル起動の固定費が支配的になる。
-- HMX 経路は NaN を出し、HVX のみでも出力が run ごとに変わる。**数値の再現性が無い。**
+- HMX 経路は NaN を出し、HVX のみでも NaN と非再現が残る。**数値の再現性が無い。**
 - コーデックを Phase C で NPU 化できたとしても、その上に載る LM がこの状態では
   全体として速くも正しくもならない。
 
-したがって **Phase C（`CONV_2D_DW` の分解）は、先に HMX/HVX の数値問題を解決しない限り
-投資対効果が合わない。** 優先するなら次の順序になる:
+**Phase C を見送る理由は「K=7 が 32 非倍数だから」ではない**（§1.9 の副産物を参照。
+ガードを HMX 限定にした今、K=7 の分解は HTP で走れる）。理由は「LM が遅く・壊れているので、
+codec だけ速くしても全体が良くならない」という点。
 
-1. HMX が haru の shape で NaN を出す原因の特定（`hmx_mm_nx_2d_f32` の K 制約と
-   haru の K=2560 の組み合わせを追う）
-2. HVX のみでの出力再現性の確認（同じ入力・同じ seed で同じ結果になるか）
-3. その上で、M=1 の逐次処理で NPU が勝てるかの見極め（現状のデータでは負けている）
+優先するなら次の順序になる:
+
+1. **HVX のみで NaN が出る原因の特定** — これが最優先。HMX を切っても 4 回中 4 回 NaN なので、
+   HMX 固有の問題ではない。`GGML_HEXAGON_NDEV=1` でも再現するのでレースでもない。
+   `max_seconds` を 1〜4 に振ると出方が変わる（1 と 3 は完走、2 と 4 は NaN）ので、
+   特定の shape か状態遷移に依存していそう。
+2. **出力の再現性の確認** — 同じ入力・同じ seed で同じ結果になるか。現状は毎回変わる。
+3. **M=1 の逐次処理で NPU が勝てるかの見極め** — 現状のデータでは 25% 負けている。
+   HMX のタイルを埋めるには M を大きくする必要があり、haru の会話は 1 フレーム = 1 トークン
+   なので構造的に不利。プロンプト（`dialogue.rows`、M が大きい）だけでも速くなるかは要測定。
 
 **現時点の結論: HaruVoice は CPU 実行のままが正しい。** NPU は「到達できる」が
 「速くならない・正しくない」ので、配布物に載せる理由がない。
