@@ -298,12 +298,17 @@ NPU 到達の壁は **manifest の `<uses-native-library>` 1 行**で、これ�
 
 次の一手の候補:
 
-1. **`CONV_2D_DW` の HTP カーネルを書く** — `ggml-hexagon` の `htp/` に op を足す。
-   depthwise conv は `IM2COL` + `MUL_MAT` に分解できるので、既存の `HTP_OP_IM2COL` と
-   `HTP_OP_MUL_MAT` で代替できる可能性がある。まずは `op_remap_to_htp` に
-   `GGML_OP_CONV_2D_DW` を足して `IM2COL`+`MUL_MAT` に書き換えるのが最短。
+1. **`CONV_2D_DW` を `IM2COL` + `MUL_MAT` に分解する** — これが最短。
+   `ggml-hexagon` は `HTP_OP_IM2COL` と `HTP_OP_MUL_MAT` を両方実装済みで、
+   `op_remap_to_htp()` に `GGML_OP_CONV_2D_DW` の case を足して、グラフ構築時に
+   depthwise conv をこの 2 つに書き換えれば既存カーネルで走る可能性が高い。
+   depthwise (group = channels) なので、`IM2COL` のあとの `MUL_MAT` は
+   チャネルごとの独立した小さな積和になり、`MUL_MAT` のバッチ扱いで表現できるかが焦点。
 2. **`ggml_backend_sched` へ載せ替える** — コーデックを CPU、LLM を HTP に振り分ける。
-   `qwen35-decoder.cpp` に前例がある。ただし haru のグラフ構築を作り直す規模。
+   `Graph::compute(ggml_backend_sched_t)` は既にあり (`src/common/graph.cpp:101`)、
+   `qwen35-decoder.cpp` に前例がある。ただし haru の 3 か所
+   (`codec.cpp:228,268`, `dialogue.cpp:148,199`, `head.cpp:76`) はすべて
+   単一バックエンドの `compute(backend, allocr)` を呼んでいるので、そこの載せ替えが要る。
 3. **Vulkan の `conv2d_dw` を直す** — 速度は出ているので、シェーダの CWHN 解釈を
    修正できれば一番近い。ただし Adreno 固有の問題かどうかの切り分けが要る。
 
