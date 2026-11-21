@@ -1,14 +1,24 @@
-# NPU / GPU 調査記録 (2026-11-21)
+# NPU / GPU 調査記録
 
-HaruVoice 0.2.5 の CPU 実行 (RTFx 0.35 前後) を高速化できないか、Snapdragon 8 Elite Gen 5
+HaruVoice の CPU 実行 (RTFx 0.35 前後) を高速化できないか、Snapdragon 8 Elite Gen 5
 (SM8850, `canoe`) の Hexagon NPU と Adreno 840 GPU を実機 (nubia NX741J, Android 16, user ビルド,
-root なし) で検証した記録。**結論: どちらも HaruVoice の APK からは実用にならない。**
+root なし) で検証した記録。
 
-## 1. Hexagon NPU (ggml-hexagon) — 不可
+**結論: NPU には到達できる。ただし haru のコーデックが使う `CONV_2D_DW` が Hexagon バックエンドに
+無いため、モデル全体は動かない。GPU も実用にならない。現状は CPU 実行が正解。**
 
-### ビルドは成功する
+> **2026-11-21 追記: 初版の「NPU 不可」は誤診だった。** 初版は `dlopen("libcdsprpc.so")` の
+> `not found` を「非 root では到達不能」と結論したが、実際の原因は
+> **`AndroidManifest.xml` の `<uses-native-library>` 宣言の欠落**だった。宣言を足すと
+> `dlopen=ok`、`HTP0 / Hexagon` 列挙、HTP セッション生成まで通る。§1 を書き直した。
 
-`GGML_HEXAGON=ON` で arm64-v8a 向け `speech` と HTP スケル `libggml-htp-v81.so` のビルドは通った。
+---
+
+## 1. Hexagon NPU — 到達はするがコーデックで止まる
+
+### 1.1 ビルド
+
+`GGML_HEXAGON=ON` で arm64-v8a 向け `speech` と HTP スケル `libggml-htp-v81.so` のビルドは通る。
 
 ```
 cmake -S D:\build\speech.cpp-main -B D:\build\android-hexagon -G Ninja
@@ -21,45 +31,137 @@ cmake -S D:\build\speech.cpp-main -B D:\build\android-hexagon -G Ninja
 ```
 
 - `speech.stripped` 5,910,888 bytes
-- `libggml-htp-v81.so` 885,064 bytes, ELF `e_machine = 0xA4` (Hexagon)
-- デバイスの HTP アーキテクチャは **v81** (`/vendor/lib/rfsa/adsp/libQnnHtpV81Skel.so` が存在)
+- `libggml-htp-v81.so` 885,064 bytes, `elf32-hexagon` (e_machine `0xA4`)
+- デバイスの HTP は **v81** (`/vendor/lib/rfsa/adsp/libQnnHtpV81Skel.so` が存在)
 
-### しかし実行時に NPU へ到達できない
+**注意: `libggml-htp-v81.so` に llvm-strip をかけてはいけない。** arm64 前提の stripper は
+Hexagon ELF を壊す。`speech` 本体だけを strip する。
 
-最小プローブ APK (`com.yuubinnkyoku.nputest`, 本物の HaruVoice 鍵で署名) を実機に入れて確認した。
+### 1.2 鍵は manifest の 1 行 — `<uses-native-library>`
 
-| 試行 | 結果 |
-|---|---|
-| `open("/dev/fastrpc-cdsp")` | `EACCES (Permission denied)` |
-| `open("/dev/fastrpc-cdsp-secure")` | `EACCES` |
-| `open("/dev/fastrpc-adsp-secure")` | `EACCES` |
-| `dlopen("libcdsprpc.so")` | `library "libcdsprpc.so" not found` |
-| `/vendor/lib64/libcdsprpc.so` をアプリ領域へコピーして `dlopen` | `library "vendor.qti.hardware.dsp@1.0.so" not found` |
+Android 12+ (API 31+) では、`/vendor/etc/public.libraries.txt` 掲載の vendor public library でも、
+アプリが `<uses-native-library>` で宣言しないと classloader namespace (`clns-*`) に露出しない。
+libnativeloader が manifest を読んで namespace を構成するため。
 
-理由は 2 つで、どちらも通常のアプリでは回避できない。
+```xml
+<application ...>
+    <uses-native-library android:name="libcdsprpc.so" android:required="false" />
+    <uses-native-library android:name="libOpenCL.so"   android:required="false" />
+    <uses-native-library android:name="libvndksupport.so" android:required="false" />
+```
 
-1. **DAC + SELinux**: `/dev/fastrpc-cdsp` は `crw-rw-r-- system system`、ラベル
-   `u:object_r:vendor_qdsp_device:s0`。アプリのコンテキストは
-   `u:r:untrusted_app_27:s0:c115,c260,c512,c768` で、`vendor_qdsp_device` への `rw` が無い。
-   `getenforce` は `Enforcing`。**shell (uid 2000, `u:r:shell:s0`) でも同じく `Permission denied`**
-   になるので、`adb shell` からも開けない。
-2. **リンカ名前空間**: `/linkerconfig/ld.config.txt` の `namespace.default.search.paths` は
-   `/system/${LIB}` と `/system_ext/${LIB}` のみ。`/vendor/lib64` は `permitted.paths` にも無い。
-   `libcdsprpc.so` は `/vendor/etc/public.libraries.txt` に載っているが、この端末では
-   アプリの名前空間から見えない。コピーしても `vendor.qti.hardware.dsp@1.0.so` など
-   vendor 専用の依存が芋づる式に足りなくなる。
+- 配置は **`<application>` の子**。`<manifest>` 直下だと AAPT が
+  `unexpected element <uses-native-library> found in <manifest>` で失敗する。
+- **`libcdsprpc.so` は APK に同梱しない。** 同梱すると vendor の正規クライアントを遮蔽し、
+  unsigned PD が `0xffffffff` で拒否される。宣言で vendor のを借りる。
+- `extractNativeLibs="true"` にして、スケルが `nativeLibraryDir` に実体として展開されるようにする。
 
-`ggml-hexagon` は HTP スケルを DSP 側のローダに `file:///libggml-htp-v81.so?...` として読ませる
-設計なので、そもそもホスト側から `libcdsprpc.so` を `dlopen` できない時点で動かない。
+### 1.3 実測: G1〜G3 は PASS
 
-**回避するには** system 署名 / priv-app としてのインストール、root シェル、または Qualcomm QNN を
-vendor 側の HTP スケル経由で使う構成のいずれかが要る。いずれも配布 APK では取れない。
+プローブ APK (`com.yuubinnkyoku.haruprobe`, minSdk 32 / targetSdk 36, 本物の HaruVoice 鍵で署名) を
+実機に入れ、**アプリプロセス内**で JNI から確認した。
+
+```
+process      = /system/bin/app_process64
+uid          = 11141
+dlopen(libcdsprpc.so) = ok
+  dlsym remote_session_control   = ok
+  dlsym remote_handle64_open     = ok
+  dlsym remote_handle64_invoke   = ok
+  dlsym dspqueue_create          = ok
+  dlsym fastrpc_mmap             = ok
+  dlsym rpcmem_alloc             = ok
+dlopen(libOpenCL.so)  = ok
+
+/proc/self/maps, libcdsprpc:
+  6e96a9c000-6e96aca000 r--p 00000000 fe:11 38332741  /vendor/lib64/libcdsprpc.so
+  6e96acc000-6e96b25000 r-xp 00030000 fe:11 38332741  /vendor/lib64/libcdsprpc.so
+  6e96b28000-6e96b29000 r--p 0008c000 fe:11 38332741  /vendor/lib64/libcdsprpc.so
+  6e96b2c000-6e96b2d000 rw-p 00090000 fe:11 38332741  /vendor/lib64/libcdsprpc.so
+
+ggml devices, in this process:
+  count = 2
+  [0] HTP0 / Hexagon / type=1 / 0.0 GiB free of 0.0 GiB
+  [1] CPU / CPU / type=0 / 14.9 GiB free of 14.9 GiB
+```
+
+`HTP0 / Hexagon / type=1` は Zenz の実績と完全に一致する。
+
+**HTP セッションも生成できた** (`speech_log_set` で取得):
+
+```
+ggml-hex: HTP0 allocating new session : domain 1000 phys-idx 0 virt-idx 0
+ggml-hex: HTP0 hwinfo: threads 8, hvx 8, hmx 1, vtcm 8 MB
+ggml-hex: HTP0 new session : session-id 0 domain-id 100000
+          uri file:///libggml-htp-v81.so?htp_iface_skel_handle_invoke&_modver=1.0&_dom=nsp1000&_session=0
+          handle 0xb4000070d06675a0
+ggml-hex: HTP0 op batching: n-bufs 16 n-tensors 8192 n-ops 1280 vmem 3344539648
+ggml-hex: HTP0 power mode: burst
+```
+
+unsigned PD は通過し、`remote_session_control` のエラーは出ていない。**G1 (dlopen) / G2 (列挙) /
+G3 (セッション) はすべて PASS。**
+
+### 1.4 落とし穴: 子プロセスでは宣言が効かない
+
+最初のプローブは `speech` を子プロセスとして `exec` したが、これでは
+`dlopen failed: library "libcdsprpc.so" not found` のままだった。
+
+**`exec` で起動した子プロセスは `/linkerconfig/ld.config.txt` から新しい namespace を作るので、
+アプリの classloader namespace (`clns-*`) を引き継がない。** manifest の宣言は
+アプリプロセス内の `dlopen` にしか効かない。判定は必ず JNI などで**プロセス内**から行うこと。
+
+### 1.5 もう 1 つの落とし穴: `ADSP_LIBRARY_PATH`
+
+セッション生成が最初 `error 0x80000406` (`AEE_EUNABLETOLOAD`) で失敗した。
+`ggml-hexagon` はスケルを `file:///libggml-htp-v81.so?...` として DSP 側ローダに渡すが、
+**`ADSP_LIBRARY_PATH` を自分では設定しない** (呼び出し側の責任)。設定しないとローダが
+スケルを見つけられない。
+
+```c
+setenv("ADSP_LIBRARY_PATH", nativeLibDir, 1);
+setenv("DSP_LIBRARY_PATH",  nativeLibDir, 1);
+```
+
+これを足した瞬間にセッションが通った。
+
+### 1.6 G4 は FAIL — `CONV_2D_DW` が無い
+
+セッションが通ったので会話を開始したところ、`haru::Codec::encode` の中で abort した。
+ggml の abort コールバック (`ggml_set_abort_callback`) でメッセージを取ると:
+
+```
+D:/build/speech.cpp-main/ggml/src/ggml-hexagon/ggml-hexagon.cpp:8421:
+ggml-hex: graph-compute CONV_2D_DW is not supported
+```
+
+`ggml-hexagon` の `op_remap_to_htp()` に `GGML_OP_CONV_2D_DW` の case が無く、`default:` で
+`GGML_ABORT` する。haru のコーデックは `ggml_conv_2d_dw_direct()` を 1 回使うので
+(`src/families/haru/codec.cpp:153`)、**モデル全体を HTP に載せることはできない。**
+
+`GGML_HEXAGON_OPFILTER=CONV_2D_DW` で `supports_op` から外しても回避できない。
+speech.cpp はバックエンドスケジューラを使わず、グラフを 1 つのバックエンドに丸ごと渡すため
+(`src/common/graph.cpp` の `compute_graph`)、`supports_op` を通らずに `graph_compute` に来る。
+
+### 1.7 部分オフロードの見通し
+
+LLM 部分だけ HTP に載せる案は、**speech.cpp 側にバックエンド分割の仕組みが要る**。
+`ModelFile` は `place` コールバックでテンソルごとにバックエンドを選べるが
+(`src/common/model-file.h`)、グラフの計算は `Graph::compute(backend, allocr)` で
+単一バックエンドに固定されている。`ggml_backend_sched` を使う経路は
+`qwen35-decoder.cpp` にしかない。
+
+つまり現状の haru 実装では、コーデックと LLM が同じグラフ実行系に乗っているため、
+片方だけ NPU に逃がすには `ggml_backend_sched` への載せ替えが要る。これは
+「manifest 1 行」では済まない規模の変更になる。
+
+---
 
 ## 2. Adreno GPU — 動くが出力が壊れる
 
-### OpenCL バックエンド
+### 2.1 OpenCL バックエンド
 
-`GGML_OPENCL=ON` でビルドでき、`speech devices` が GPU を列挙する。
+`GGML_OPENCL=ON` でビルドでき、GPU を列挙する。
 
 ```
 GPUOpenCL  gpu   QUALCOMM Adreno(TM) 840, 8.0 GB, 6.9 GB free
@@ -67,18 +169,18 @@ CPU        cpu   CPU, 16.0 GB, 16.0 GB free
 ```
 
 OpenCL 3.0 (`QUALCOMM build: 0842.23`)、compute units 12、max work group 1024。
-`libOpenCL.so` は `/vendor/lib64` にあり、`public.libraries.txt` 経由でアプリからも `dlopen` できる
-(こちらは名前空間の問題が起きない)。
+`libOpenCL.so` は `public.libraries.txt` 経由でアプリから `dlopen` できる
+(こちらは manifest 宣言があれば名前空間の問題は起きない)。
 
-**しかし haru のコーデックが使う `GGML_OP_CONV_2D_DW` を OpenCL バックエンドが実装していない。**
-`ggml_opencl_supports_op` に `CONV_2D_DW` の case が無く、実行時に落ちる。
+**しかし `GGML_OP_CONV_2D_DW` を OpenCL バックエンドが実装していない。**
+`ggml_opencl_supports_op` に case が無く、実行時に落ちる。
 
 ```
 ggml_backend_opencl_graph_compute: error: op not supported node_40 (CONV_2D_DW)
 GGML_ASSERT(ok) failed
 ```
 
-### Vulkan バックエンド
+### 2.2 Vulkan バックエンド
 
 `GGML_VULKAN=ON` でビルドでき、`CONV_2D_DW` も実装されている。
 
@@ -87,9 +189,7 @@ Vulkan0    igpu  Adreno (TM) 840, 20.3 GB, 20.3 GB free
 CPU        cpu   CPU, 16.0 GB, 16.0 GB free
 ```
 
-ビルドには NDK に無いものが要る (詳細は §4)。
-
-**素のままだと `vkGetDeviceFaultInfoEXT` でヌルポインタ参照して落ちる。**
+素のままだと `vkGetDeviceFaultInfoEXT` でヌルポインタ参照して落ちる。
 `GGML_VK_DISABLE_FUSION=1` を付けると最後まで走る。
 
 ```
@@ -112,13 +212,15 @@ out.wav: 6.40 s of audio in 48 frames, computed in 14.120 s, RTFx 0.45
 | CPU | 19,494 | 849 | 正常な音声 |
 | Vulkan | 32,767 | 32,712 | ±32767 に張り付いた飽和波形 |
 
-サンプル値の分布を見ると 153,600 サンプル中 80,136 個が `+32767`、72,689 個が `-32767` で、
-実質的に矩形波。`GGML_VK_DISABLE_COOPMAT`, `DISABLE_COOPMAT2`, `DISABLE_MMVQ`,
-`DISABLE_BFLOAT16`, `DISABLE_GRAPH_OPTIMIZE`, `DISABLE_MULTI_ADD`, `DISABLE_ASYNC`,
-`SERIALIZE_SUBMISSIONS` のいずれを足しても変わらない。`CONV_2D_DW` のシェーダ
-(`conv2d_dw.comp`) か、その入力の CWHN レイアウト解釈が Adreno 840 で合っていないと見られる。
+153,600 サンプル中 80,136 個が `+32767`、72,689 個が `-32767` で、実質的に矩形波。
+`GGML_VK_DISABLE_COOPMAT`, `DISABLE_COOPMAT2`, `DISABLE_MMVQ`, `DISABLE_BFLOAT16`,
+`DISABLE_GRAPH_OPTIMIZE`, `DISABLE_MULTI_ADD`, `DISABLE_ASYNC`, `SERIALIZE_SUBMISSIONS` の
+いずれを足しても変わらない。`conv2d_dw.comp` の CWHN レイアウト解釈が Adreno 840 で
+合っていないと見られる。
 
 したがって **Vulkan は速度だけなら 1.26 倍だが、音声が使えないので採用できない。**
+
+---
 
 ## 3. CPU 側で試したこと
 
@@ -133,18 +235,18 @@ out.wav: 6.40 s of audio in 48 frames, computed in 14.120 s, RTFx 0.45
 `GGML_OPENMP=OFF` にすると `libomp.so` が不要になり APK が 961 KB 軽くなる。速度への影響は
 測定誤差の範囲。**0.2.5 の同梱バイナリは `-march` なし・OpenMP ありのまま**で、これが現状最速。
 
+---
+
 ## 4. Vulkan ビルドに必要な追加物 (NDK に無い)
 
-NDK r27c には Vulkan の C++ バインディングと SPIR-V のヘッダが入っていない。以下を用意した。
+NDK r27c には Vulkan の C++ バインディングと SPIR-V のヘッダが入っていない。
 
 - `vulkan.hpp` ほか Vulkan-Hpp のヘッダ一式 — `VK_HEADER_VERSION 275` (NDK r27c と一致) の
   タグ `v1.3.275` から取得
 - `spirv/unified1/spirv.hpp` ほか — SPIRV-Headers から取得
 - `SPIRV-HeadersConfig.cmake` のスタブ — `find_package(SPIRV-Headers CONFIG REQUIRED)` を
-  満たすためだけのもの (実際には使われない)
-- `glslc.exe` — NDK の `shader-tools/windows-x86_64/` に同梱されている
-
-configure はこうなる。
+  満たすためだけのもの
+- `glslc.exe` — NDK の `shader-tools/windows-x86_64/` に同梱
 
 ```
 cmake -S D:\build\speech.cpp-main -B D:\build\android-vulkan -G Ninja
@@ -158,9 +260,9 @@ cmake -S D:\build\speech.cpp-main -B D:\build\android-vulkan -G Ninja
 
 `speech.stripped` は 25,607,320 bytes (CPU 版の 4.5 倍)。`libvulkan.so` に依存する。
 
-## 5. 副産物として見つかった ggml-opencl のバグ
+---
 
-OpenCL を試す過程で、`ggml-opencl` の Q8_0 レイアウト変換パスに実バグを見つけた。
+## 5. 副産物として見つかった ggml-opencl のバグ
 
 `ggml_backend_opencl_buffer_set_tensor()` の Q8_0 分岐は、渡された `offset` と `size` を無視して
 **`ggml_nbytes(tensor)` バイトを `data` から読む**。一方 `ModelFile::load()` は
@@ -178,17 +280,31 @@ OpenCL を試す過程で、`ggml-opencl` の Q8_0 レイアウト変換パス�
 ```
 
 `src/common/model-file.cpp` に `read_piece()` を足し、バッファ名が `OpenCL` のときだけ
-テンソルを分割せず丸ごと読むようにした。これでこのクラッシュは消える (その先で
-`CONV_2D_DW` 非対応に当たるので、OpenCL 自体は使えないまま)。
+テンソルを分割せず丸ごと読むようにした。これでこのクラッシュは消える。
 
-## 6. 結論
+---
 
-- **NPU は無理**。非 root の user ビルドでは `/dev/fastrpc-cdsp` を開けず、`libcdsprpc.so` も
-  ロードできない。ビルドは通るが実行できない。
-- **GPU も今は無理**。Vulkan は 1.26 倍速いが音声が飽和して壊れる。OpenCL は
-  `CONV_2D_DW` 未実装で動かない。
-- **CPU のままが正解**。0.2.5 の同梱バイナリ (素の `-march`、OpenMP あり) が現状最速で、
-  `-march` を盛っても速くならない。
+## 6. 結論と次の一手
 
-将来 Vulkan の `CONV_2D_DW` が Adreno で正しく動くようになれば、`GGML_VK_DISABLE_FUSION=1`
-を既定にして GPU に載せる道はある。それまでは CPU 版を配る。
+| 経路 | 到達 | 実用 | 止まっている理由 |
+|---|---|---|---|
+| Hexagon NPU | **可** | 不可 | `CONV_2D_DW` が `ggml-hexagon` に無い |
+| Adreno OpenCL | 可 | 不可 | `CONV_2D_DW` が `ggml-opencl` に無い |
+| Adreno Vulkan | 可 | 不可 | 音声が飽和して壊れる |
+| CPU | — | **可** | 現状最速 (RTFx 0.35) |
+
+NPU 到達の壁は **manifest の `<uses-native-library>` 1 行**で、これは解消済み。
+残る壁は `CONV_2D_DW` のカーネルが無いこと。
+
+次の一手の候補:
+
+1. **`CONV_2D_DW` の HTP カーネルを書く** — `ggml-hexagon` の `htp/` に op を足す。
+   depthwise conv は `IM2COL` + `MUL_MAT` に分解できるので、既存の `HTP_OP_IM2COL` と
+   `HTP_OP_MUL_MAT` で代替できる可能性がある。まずは `op_remap_to_htp` に
+   `GGML_OP_CONV_2D_DW` を足して `IM2COL`+`MUL_MAT` に書き換えるのが最短。
+2. **`ggml_backend_sched` へ載せ替える** — コーデックを CPU、LLM を HTP に振り分ける。
+   `qwen35-decoder.cpp` に前例がある。ただし haru のグラフ構築を作り直す規模。
+3. **Vulkan の `conv2d_dw` を直す** — 速度は出ているので、シェーダの CWHN 解釈を
+   修正できれば一番近い。ただし Adreno 固有の問題かどうかの切り分けが要る。
+
+いずれも「manifest 1 行」では済まない。**HaruVoice 0.2.5 は CPU のまま配るのが正しい。**

@@ -58,7 +58,11 @@ base64 -d signing/HaruVoice-signing-key.jks.b64 > HaruVoice-signing-key.jks
 - F16 量子化モデルは ARM CPU でオーバーフロー停止するため使用禁止。Q8_0（推奨）か Q6_K を使う。
 - APK バイナリは当面 artifacts で配布。GitHub Releases への格納は追って実施する。
 - 実機: nubia NX741J（Snapdragon 8 Elite Gen 5、Android 36、16GB）で動かす前提。
-- **NPU と GPU は使えない。** Hexagon NPU は非 root の user ビルドでは `/dev/fastrpc-cdsp` を開けず
-  `libcdsprpc.so` もロードできない。Adreno GPU は Vulkan なら 1.26 倍速いが生成音声が飽和して壊れ、
-  OpenCL は `CONV_2D_DW` 未実装で動かない。CPU 実行のままが正解。詳細は
-  `docs/NPU-GPU-FINDINGS.md`。
+- **NPU には到達できるが、モデルは動かない。** `AndroidManifest.xml` の `<application>` に
+  `<uses-native-library android:name="libcdsprpc.so" android:required="false"/>` を書けば、
+  通常アプリのプロセスから `dlopen=ok`、`HTP0 / Hexagon` 列挙、HTP セッション生成まで通る
+  （実機で確認済み）。ただし haru のコーデックが使う `CONV_2D_DW` が `ggml-hexagon` に無く、
+  `ggml-hex: graph-compute CONV_2D_DW is not supported` で停止する。
+- **GPU も実用にならない。** Vulkan は 1.26 倍速いが生成音声が飽和して壊れ、OpenCL は
+  `CONV_2D_DW` 未実装で動かない。
+- 以上から **CPU 実行のままが正解**。詳細と次の一手は `docs/NPU-GPU-FINDINGS.md`。
