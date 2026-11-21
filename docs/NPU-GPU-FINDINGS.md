@@ -337,6 +337,96 @@ signal 11 (SIGSEGV), fault addr 0x2538a80821601540
 **次の一手は (a) と (b) の 2 つに絞られた。** どちらも hexagon バックエンド側の修正で、
 haru 側の変更ではない。
 
+### 1.11 第4ラウンド: バグ (b) を修正、仮説 (a) は否定
+
+#### §1 skel の系譜 — 問題なし
+
+`libggml-htp-v81.so` は `htp-v81-prefix` の ExternalProject が 2026-11-21 にソースから
+ビルドしたもので、fork HEAD の内容が入っている。prebuilt の古い skel を使い回してはいない。
+
+#### §2 仮説 (a) は否定 — CONT + view は bit-exact
+
+`htp-cont-test` を書いて、head の `part()` と同じ形状系列を両バックエンドで走らせた:
+
+```
+cont of view, [3 x 2560, 1] -> 3 x [2560, 1]:
+  part 0 (offset 0)            bit-exact (2560 values)
+  part 1 (offset 2560)         bit-exact (2560 values)
+  part 2 (offset 5120)         bit-exact (2560 values)
+cont of strided view, [2624 x 3] rows of 2560:
+  strided row 0..2             bit-exact (2560 values)
+ALL BIT-EXACT
+```
+
+CPU も HTP も同じ結果。**`CONT` の view オフセット処理にバグは無い。**
+head の各 op 単体（`scale_bias` / `rms_norm` / `silu` / `mul_mat`）も両バックエンドで一致した。
+head のグラフ全体（F16 重み、5 run）も HTP で有限・bit 一致。
+
+**つまり head 単体では再現しない。** 再現には LM と head を混ぜた構成が要る。
+
+#### §3 バグ (b) の正体 — CPU テンソルを hexagon のバッファとして読んでいた
+
+`clone_buffer` のクラッシュを追うと、根は **`mmap_tensor()` が `t->buffer->context` を
+無条件に `ggml_hexagon_shared_buffer *` にキャストしていた**ことだった。CPU バッファの
+テンソルが来ると、CPU バックエンドのコンテキストを hexagon の構造体として読み、
+`mem` に garbage が入って `clone_buffer()` で落ちる。
+
+同じ無条件キャストが 4 箇所にあった:
+
+| 箇所 | 症状 |
+|---|---|
+| `mmap_tensor()` | `clone_buffer()` で SIGSEGV |
+| `fit_op()` の `fit_tensor` | `sbuf->fd()` で SIGSEGV |
+| `add_tensor()` | `sbuf->base()` で SIGSEGV |
+| `fit_op` の別経路 | `sbuf->fd()` で SIGSEGV |
+
+修正は 4 つ:
+
+1. **`mmap_tensor()`**: `ggml_backend_buffer_is_hexagon(t->buffer)` でなければ `nullptr` を返す
+2. **`fit_op()` / 別経路**: CPU テンソルはバッチの容量を食わないので `continue`
+3. **`add_tensor()`**: CPU テンソルが来たら `GGML_ABORT` でテンソル名を出す
+   （黙ってゴミを読むより、どのテンソルが問題か分かる方がよい）
+4. **`supports_op()`**: 入力に CPU バッファのテンソルがあれば `false`
+   （`view_src` も辿る）
+
+さらに **`ggml-backend.cpp` の scheduler** に 1 箇所:
+
+5. 重みのバッファでバックエンドを決める経路が `supports_op()` を見ずに `return` していた。
+   `ggml_backend_supports_op()` を通してから返すようにした。これで「重みは HTP だが
+   別の入力が CPU」というノードが HTP に置かれなくなる。
+
+そして **`Head` に CPU バックエンドを渡す**ようにした。`head.constants`（4 つのスカラーの
+埋め込み）は head の重みを読むので、重みが CPU にあるなら CPU で計算する必要がある。
+`Head(m, backend, cpu)` とし、`allocr_` と `compute()` をそのバックエンドに向けた。
+
+#### 結果: SIGSEGV は消えた
+
+`SPEECH_HEAD_CPU=1`（head を CPU に置く構成）で 4 回走らせて、**SIGSEGV は 0 回**。
+以前は 4/4 で落ちていた。バグ (b) は修正できた。
+
+#### ただし NaN は残る（2/6）
+
+head を HTP に戻した既定構成で 6 回走らせると **2/6 で `latent` が NaN**。
+`SPEECH_HEAD_TRACE` で追うと、head の `x`（ブロックを回る潜在変数）が NaN になり、
+`cond` と `ada` は正常。head を CPU に置いても同じ `x` が NaN になるので、
+**head の計算そのものではなく、その入力（`noise` か `hidden`）が壊れている**可能性が高い。
+
+`noise` は `g.input()` で作られ、scheduler がバックエンドを決める。head が CPU にあると
+`noise` も CPU に置かれ、`latent_proj`（HTP の重み）と衝突する構図が疑わしい。
+
+#### 第4ラウンドの判定
+
+| 項目 | 状態 |
+|---|---|
+| skel 系譜 | 問題なし（ソースから再ビルド済み） |
+| 仮説 (a) CONT+view | **否定**（bit-exact） |
+| バグ (b) SIGSEGV | **修正済み**（4 箇所のガード + scheduler + Head の CPU バックエンド） |
+| NaN | **残存**（2/6）。入力テンソルのバックエンド跨ぎが疑わしい |
+| M=1 速度判定 | 未到達（NaN が消えてから） |
+
+**次の一手**: `noise` と `hidden` のどちらが壊れるかを、head の入力時点で読んで確定させる。
+`g.input()` で作ったテンソルが scheduler でどのバックエンドに置かれるかを追えばよい。
+
 #### Phase C の前提が変わった点（重要）
 
 指示書には「幅 7 の conv は分解しても K=7 が 32 非倍数で CPU 回帰になる」とあるが、
