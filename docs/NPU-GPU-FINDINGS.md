@@ -4,13 +4,17 @@ HaruVoice の CPU 実行 (RTFx 0.35 前後) を高速化できないか、Snapdr
 (SM8850, `canoe`) の Hexagon NPU と Adreno 840 GPU を実機 (nubia NX741J, Android 16, user ビルド,
 root なし) で検証した記録。
 
-**結論: NPU には到達できる。ただし haru のコーデックが使う `CONV_2D_DW` が Hexagon バックエンドに
-無いため、モデル全体は動かない。GPU も実用にならない。現状は CPU 実行が正解。**
+**結論: NPU には到達でき、LM を HTP で走らせることまで成功した。ただし (1) コーデックの
+`CONV_2D_DW` が無い、(2) HMX 経路が NaN を出す、(3) HVX のみでも数値が不安定、(4) 速度が
+CPU より遅い、の 4 点で実用にならない。GPU も同様。現状は CPU 実行が正解。**
 
 > **2026-11-21 追記: 初版の「NPU 不可」は誤診だった。** 初版は `dlopen("libcdsprpc.so")` の
 > `not found` を「非 root では到達不能」と結論したが、実際の原因は
 > **`AndroidManifest.xml` の `<uses-native-library>` 宣言の欠落**だった。宣言を足すと
 > `dlopen=ok`、`HTP0 / Hexagon` 列挙、HTP セッション生成まで通る。§1 を書き直した。
+>
+> **2026-11-21 第2ラウンド追記: LM の HTP 実行まで到達した。** §1.8 に op インベントリ、
+> §1.9 に LM の部分オフロードの実測を足した。結論は「動くが速くならず、数値も壊れる」。
 
 ---
 
@@ -154,6 +158,105 @@ LLM 部分だけ HTP に載せる案は、**speech.cpp 側にバックエンド�
 つまり現状の haru 実装では、コーデックと LLM が同じグラフ実行系に乗っているため、
 片方だけ NPU に逃がすには `ggml_backend_sched` への載せ替えが要る。これは
 「manifest 1 行」では済まない規模の変更になる。
+
+### 1.8 第2ラウンド: op インベントリ（Phase A）
+
+`Graph::compute()` に `SPEECH_OP_INVENTORY` のフックを足し、グラフを計算する前に
+全ノードの op 名と shape を出すようにした（`src/common/graph.cpp` の `print_op_inventory()`）。
+各 call site に stage 名を付けて、どのグラフか分かるようにした。
+
+実機で `talk` を 1 回流すと 7 ステージが取れる:
+
+| stage | nodes | hexagon 未対応 |
+|---|---|---|
+| `head.constants` | 12 | なし |
+| `codec.encode` | 746 | **CONV_2D_DW × 1248** |
+| `dialogue.embed` | 17 | なし |
+| `dialogue.rows` | 1786 | なし |
+| `dialogue.emit` | 96 / 1897 | なし |
+| `codec.decode` | 779 | **CONV_2D_DW × 1248** |
+
+**LM 側（`dialogue.*` と `head.*`）は全 op が `op_remap_to_htp()` にある。**
+未対応は codec の `CONV_2D_DW` ただ 1 種で、Phase C の対象が確定した。
+
+`CONV_2D_DW` ノードの実測値（Phase C の設計に必要）:
+
+```
+encode: out(51200,1,32,1) s0(7,1,1,32) s1(51206,1,32,1) stride(1,1) pad(0,0) dil(1,1)
+        nb out(128,6553600,4,6553600) s0(128,896,128,4) s1(128,6554368,4,6554368)
+decode: out(1,1,2048,1)   s0(7,1,1,2048) s1(7,1,2048,1)  stride(1,1) pad(0,0) dil(1,1)
+        nb out(8192,8192,4,8192) s0(8192,57344,8192,4) s1(8192,57344,4,57344)
+```
+
+カーネルは幅 7 の depthwise、stride 1・pad 0・dilation 1、チャネル数 32/64/2048。
+`nb[2] == 4` がチャネル最速（CWHN）であることを示している。
+
+### 1.9 第2ラウンド: LM の部分オフロード（Phase B）
+
+#### 実装
+
+- `haru::tensor_on_cpu(name)` を足し、`codec.*` のテンソルだけ CPU に残す
+  （`src/families/haru/layout.cpp`）。LM・音声射影・head は HTP。
+- `HaruEngine` が `ModelFile` の `place` コールバックで振り分け、
+  `Dialogue` に CPU バックエンドを渡す。
+- `Dialogue::emit()` は `decoder_.scheduler()` があれば scheduler 経由で計算する
+  （`Qwen35Decoder` は `cpu` を渡すと `ggml_backend_sched` を作る）。
+
+#### 結果: 動くが 4 つの理由で実用にならない
+
+**(1) モデルロードとセッション生成は成功する。** `Loaded haru-4b on HTP0 in 7.66 s`、
+`HTP0 hwinfo: threads 8, hvx 8, hmx 1, vtcm 8 MB`、`power mode: burst`。
+
+**(2) HMX 経路が NaN を出す。** 既定（`GGML_HEXAGON_MM_SELECT=2`、HMX 優先）だと
+
+```
+speech: device: the model's audio came out as numbers that are not finite; run it on another device
+```
+
+`GGML_HEXAGON_MM_SELECT=1`（HVX のみ）にすると NaN は消え、音声も正常になる
+（peak 16641 / RMS 877 / クリップ 0）。**HMX のカーネルが haru の shape で壊れている。**
+
+**(3) HVX のみでも数値が不安定。** 同じ seed 1 で 3 回走らせると
+
+```
+run 1: " innehål that?  anto いい "   → 25.1 s
+run 2: NaN で停止
+run 3: " I . "                       → 25.2 s
+```
+
+出力が毎回変わり、NaN も出る。CPU は同じ seed で常に同じ結果（無言）を返す。
+**HTP の計算結果は再現性がなく、そのままでは使えない。**
+
+**(4) CPU より遅い。** `talk` の実測（6.40 s の音声、48 フレーム）:
+
+| 実行 | 1 回目 | 2 回目 | 3 回目 | RTFx |
+|---|---|---|---|---|
+| CPU | 20.98 s | 20.05 s | 19.90 s | 0.31–0.32 |
+| HTP0 (HVX のみ) | 25.47 s | 25.37 s | 25.11 s | 0.25 |
+
+**NPU の方が 25% 遅い。** 1 フレームずつ（M=1）の行列積では HMX のタイルが埋まらず、
+重み転送とカーネル起動の固定費が支配的になるため。llama.cpp で NGL を上げると速くなるのは
+プロンプト（M が大きい）をまとめて処理するからで、haru の会話は 1 フレーム = 1 トークン
+ずつの逐次処理なので同じ効果が得られない。
+
+#### 副産物: `ggml-hexagon` の `supports_op` バグ
+
+`ggml_hexagon_supported_mul_mat()` が **K が 32 の倍数でない行列積を「対応」と答えていた**。
+DSP 側の `hmx_mm_nx_2d_f32()` は `if (k % 32 != 0) return HTP_STATUS_NO_SUPPORT;` で拒否するので、
+1 行ステップの attention（K=2）で
+
+```
+ggml-hex: HTP0 dspcall : dsp-rsp NO-SUPPORT
+ggml-hex: HTP0 synchronize failed : dsp-error NO-SUPPORT
+```
+
+となりプロセスごと abort していた。`src0->ne[0] % 32 != 0` なら `false` を返すように修正した
+（`ggml-hexagon.cpp`）。これで該当ノードは scheduler が CPU に回す。
+
+#### 副産物: `haru-timing` は NPU で走らない
+
+`haru-timing` は codec を直接呼ぶので `CONV_2D_DW` に当たり abort する。
+Phase B の速度は `talk` の `computed in` で判断するしかない。
 
 ---
 
@@ -313,3 +416,24 @@ NPU 到達の壁は **manifest の `<uses-native-library>` 1 行**で、これ�
    修正できれば一番近い。ただし Adreno 固有の問題かどうかの切り分けが要る。
 
 いずれも「manifest 1 行」では済まない。**HaruVoice 0.2.5 は CPU のまま配るのが正しい。**
+
+### 6.1 第2ラウンドの結果を踏まえた優先度の見直し
+
+Phase B（LM だけ HTP）を実際に走らせた結果、**Phase C に進む価値は下がった**。
+
+- LM を HTP に載せても **CPU より 25% 遅い**（25.4 s vs 20.0 s）。1 フレーム = 1 トークンの
+  逐次処理では HMX のタイルが埋まらず、転送とカーネル起動の固定費が支配的になる。
+- HMX 経路は NaN を出し、HVX のみでも出力が run ごとに変わる。**数値の再現性が無い。**
+- コーデックを Phase C で NPU 化できたとしても、その上に載る LM がこの状態では
+  全体として速くも正しくもならない。
+
+したがって **Phase C（`CONV_2D_DW` の分解）は、先に HMX/HVX の数値問題を解決しない限り
+投資対効果が合わない。** 優先するなら次の順序になる:
+
+1. HMX が haru の shape で NaN を出す原因の特定（`hmx_mm_nx_2d_f32` の K 制約と
+   haru の K=2560 の組み合わせを追う）
+2. HVX のみでの出力再現性の確認（同じ入力・同じ seed で同じ結果になるか）
+3. その上で、M=1 の逐次処理で NPU が勝てるかの見極め（現状のデータでは負けている）
+
+**現時点の結論: HaruVoice は CPU 実行のままが正しい。** NPU は「到達できる」が
+「速くならない・正しくない」ので、配布物に載せる理由がない。
