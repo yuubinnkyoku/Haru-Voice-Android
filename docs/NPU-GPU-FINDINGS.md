@@ -427,6 +427,68 @@ head を HTP に戻した既定構成で 6 回走らせると **2/6 で `latent`
 **次の一手**: `noise` と `hidden` のどちらが壊れるかを、head の入力時点で読んで確定させる。
 `g.input()` で作ったテンソルが scheduler でどのバックエンドに置かれるかを追えばよい。
 
+### 1.12 第5ラウンド: 測定の誤りを発見（重要）
+
+#### 4点フックの実装
+
+`SPEECH_HEAD_TRACE` を拡張し、フレームごとに `noise` / `hidden` / head の `x` / `ada` / `velocity` /
+`out` の有限性と FNV-1a hash、および**最初の非有限 index** を出すようにした。
+
+#### 最初の測定結果（誤り）
+
+```
+run1: noise hash 86bd444b2bf94938, hidden b9736ad0b6699ba0, x ok
+run2: noise hash 86bd444b2bf94938, hidden 8bafd005a68d18e5, x ok
+run3: noise hash 5a07a9cc850895cb, hidden 87d0c870eaf90a2d, x NAN first=0
+```
+
+CPU では 3/3 で `noise` も `hidden` も同一 hash（完全に決定的）。HTP では `noise` が 5 回中 2 回、
+`hidden` が 5/5 で違う値になった。**「noise の読み出しが壊れている」と判断しかけた。**
+
+#### しかしこの測定は無効だった
+
+`GGML_HEXAGON_VERBOSE=1` のログを取って、テンソルの配置を確認した:
+
+```
+init-tensor HTP0#leaf_513#0 : base 0x772f000000 data 0x772f000000 nbytes 256   ← noise
+init-tensor node_1895       : base 0x772f000000 data 0x772f000180 nbytes 256
+init-tensor node_1896       : base 0x772f000000 data 0x772f000000 nbytes 256   ← head の出力
+```
+
+**`noise`（`leaf_513`）と head の出力（`node_1896`）が同じアドレス `0x772f000000` を共有している。**
+ggml のアロケータは入力と出力の寿命が重ならないので同じメモリを再利用する。
+
+私の測定は `Graph::read(noise_t)` を **compute の後**に呼んでいたので、
+**head の出力を読んでいた**。`noise` の hash が run ごとに変わったのは、出力が変わったからで、
+`noise` の読み出しが壊れていたわけではなかった。
+
+#### 修正した測定
+
+`noise` はホスト側の `std::vector<float>` を compute の前に hash するように変えた
+（`noise_hash` を compute 前に計算し、トレースではそれを表示する）。
+
+#### この誤りから得られた確かな知見
+
+1. **`hidden` は HTP で 5/5 非決定的**（CPU は 3/3 決定的）。これは測定方法に依存しない事実で、
+   LM 側に非決定性があることを示す。第2ラウンドで観測した「run 間でテキストが違う」と整合する。
+2. **`x` の NaN は `first=0`**（先頭要素）。周期性のない先頭ヒットは、未初期化読み出しよりも
+   「計算結果が壊れている」寄りだが、`first=0` だけでは決められない。
+3. **入力と出力が同じメモリを共有する**という事実は、今後テンソルを読むときの一般則として重要。
+   compute 後に「入力」を読むと出力が返る。
+
+#### 第5ラウンドの現状
+
+| 項目 | 状態 |
+|---|---|
+| 4点フック | 実装済み（`noise` はホスト側で hash） |
+| `noise` の読み出し | **測定誤りだった**（出力を読んでいた）。修正済み |
+| `hidden` の非決定性 | **HTP で 5/5 非決定的**（CPU は決定的）。実在する問題 |
+| `x` の NaN | `first=0`。原因未確定 |
+| 再測定 | デバイスが offline になり中断。次回再開 |
+
+**次の一手**: 修正した測定で `noise` が常に同一 hash になることを確認し（そうなるはず）、
+`hidden` の非決定性を first-divergence で LM の node まで追う。
+
 #### Phase C の前提が変わった点（重要）
 
 指示書には「幅 7 の conv は分解しても K=7 が 32 非倍数で CPU 回帰になる」とあるが、
