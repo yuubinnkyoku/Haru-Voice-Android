@@ -727,6 +727,129 @@ CPU 参照が使えるようになった。
 **プロンプトの 1 回の実行の中で**分岐が起きている。`GATED_DELTA_NET` の状態初期化か、
 HMX/HVX カーネルのリダクション順序が候補。
 
+### 1.16 第7ラウンド: first-divergence で KV キャッシュへの CPY に到達
+
+#### Step 2: KV キャッシュの zero-fill は効かない
+
+`KeysValues` のバッファは `ggml_backend_alloc_ctx_tensors()` で確保され、
+**ゼロ初期化されていなかった**（`Qwen35Decoder::States` は `start()` で
+`ggml_backend_buffer_clear()` していたが、KV キャッシュはしていなかった）。
+そこで確保直後に `ggml_backend_buffer_clear(buffer_, 0)` を足して測ると、
+frame 0 の `hidden` は **4/4 で違うまま**だった:
+
+```
+c3114196c44ddc41, 8372b5204c4f5cfb, eb638401f2f496c8, 64e07bc1f30f963f
+```
+
+**未初期化読み出しではない。** この zero-fill は正しい修正として残す
+（読まれない領域が不定値であるより 0 である方が、不具合が出たときに再現しやすい）。
+
+#### Step 1: first-divergence — ノード単位の hash 比較
+
+`Graph::compute()` に `SPEECH_NODE_HASH` のフックを足し、グラフを計算した後に
+**全ノードの出力を FNV-1a で hash** して出すようにした（`print_node_hashes()`）。
+scheduler 経由の `compute(sched)` にも足した（LM はこちらを通るため）。
+
+同 seed 2 run の比較:
+
+| stage | nodes | 不一致 |
+|---|---|---|
+| `dialogue.embed` | 17 | **0** |
+| `head.constants` | 12 | **0** |
+| `codec.encode` | 582 | **0** |
+| `sched`（= `dialogue.rows`、LM） | 1475 | **1475（全部）** |
+| `codec.decode` | 581 | 581（全部） |
+
+**`dialogue.embed` の出力は 2 run で完全に同一**（`4c69ad7e58460a31`）。
+`codec.encode` も完全一致。**`sched` だけが最初のノードから違う。**
+
+```
+sched [0] MUL_MAT node_0  A=e138c7b17aa8c568 B=1a96d12af55727b5
+sched [1] MUL_MAT node_1  A=db300134c6b59325 B=e28372287fd92d57
+...
+```
+
+**入力（埋め込み）は同一なのに、LM の最初の演算から違う。**
+`codec.decode` が全部違うのは、その入力の latent が LM の出力だから（下流）。
+
+#### 原因候補: KV キャッシュへの CPY
+
+`GGML_HEXAGON_VERBOSE=1` のログを取ると、`leaf_0` という名前のテンソルが
+**2 種類**あることが分かった:
+
+```
+init-tensor HTP0#leaf_0#0 : base 0x7157a00000 nbytes 10240   ← グラフ入力（埋め込み）
+init-tensor leaf_0 (copy of (view)) : base 0x71f3200000 data 0x71f3400000 nbytes 98304
+```
+
+後者は `CPY` の出力で、**48 回**同じアドレスに再初期化される:
+
+```
+execute-op CPY| (view) x leaf_0 -> leaf_0 (copy of (view))
+  src: 3:8192  nb 4:16!   (nb[0]=4, nb[1]=16)
+  dst: 3:8192  nb 4:12    (nb[0]=4, nb[1]=12)
+```
+
+これは `KeysValues::attend()` の `g.copy()` — **新しい鍵を KV キャッシュに書く**箇所で、
+src は `ggml_permute()` の view（非連続）、dst はキャッシュの `ggml_view_3d()`（非連続）。
+
+#### カーネル選択の追跡
+
+`ggml_hexagon_precompute_cpy_params()` の判定を追うと:
+
+1. `transposed` の判定で `src0->nb[1] (16) < ne[0]*4 (32768)` が真 → `sameshape = false`
+2. `src_is_contiguous = false`、`dst_is_contiguous = false` → `1D_CONTIG` にならない
+3. `GATHER_ROWS` は `ne[0] <= 32` が条件だが `ne[0]=8192` → 該当せず
+4. `sameshape` が false なので `SAMESHAPE_SAMETYPE` を飛ばす
+5. → **`HTP_COPY_KERNEL_RESHAPE` に落ちる**
+
+#### ただし DSP 側の RESHAPE は stride を扱える
+
+`cpy-ops.c` の `DEFINE_CPY_RESHAPE` を読むと、`nb00`/`nb0` を使って
+`dma_cpy_push_2d_chunked()` に切り替える実装があり、**非連続でも動くはず**である:
+
+```c
+const bool rows_contig = (nb00 == ELEM_SIZE) && (nb0 == ELEM_SIZE);
+if (rows_contig) dma_cpy_sametype_reshape_contig(...);
+else             dma_cpy_push_2d_chunked(dma_q, dst_addr, src0_addr, nb0, nb00, ELEM_SIZE, run);
+```
+
+ホスト側も `h.nb[0..3] = t->nb[0..3]` で正しく渡しており、`same_shape()` も
+`nb` を比較しているので dedup の衝突も無い。
+
+**したがって「RESHAPE が選ばれていること」自体は誤りではない。**
+バグは `dma_cpy_push_2d_chunked()` の側、または `run` の計算
+（`MIN(MIN(ne00 - i00, ne0 - i10), th_end - e)`）にある可能性が高い。
+
+#### 試した修正とその結果
+
+「非連続なら `supports_op` で断る」修正を試したが、**CPY の出力が HTP 上に
+事前確保された KV キャッシュなので scheduler が動かせず**、こうなった:
+
+```
+pre-allocated tensor ((view) (copy of (reshaped) (permuted))) in a buffer (HTP0)
+that cannot run the operation (CPY)
+```
+
+KV キャッシュは HTP に置かれたままなので、この CPY は HTP で走るしかない。
+**修正は DSP 側の `dma_cpy_push_2d_chunked()` に入れる必要がある。** この修正は撤回した。
+
+#### 第7ラウンドの結論
+
+| 項目 | 状態 |
+|---|---|
+| KV zero-fill | **効果なし**（未初期化読み出しではない）。修正は残す |
+| first-divergence | **`sched` の node 0 から**。`dialogue.embed` は完全一致 |
+| 分岐位置 | 2 run で node 0 から全部。**固定**（timing 依存の移動ではない） |
+| 原因候補 | **KV キャッシュへの CPY**（`nb 4:16!` → `4:12`、48 回） |
+| カーネル | `HTP_COPY_KERNEL_RESHAPE`。DSP 側は stride 対応の実装がある |
+| 次の一手 | `dma_cpy_push_2d_chunked()` の実装を読む（`run` の計算と chunk 分割） |
+
+**分岐位置が固定**（毎回 node 0 から）なので、timing 依存のレースではなく
+**決定的な値の誤り**である。KV キャッシュに書かれる鍵の値が毎回違うのは、
+`dma_cpy_push_2d_chunked()` が stride を誤って解釈し、
+**バッファの不定な領域を読んでいる**ためと考えられる。
+
 #### Phase C の前提が変わった点（重要）
 
 指示書には「幅 7 の conv は分解しても K=7 が 32 非倍数で CPU 回帰になる」とあるが、
