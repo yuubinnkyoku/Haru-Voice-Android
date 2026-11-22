@@ -949,6 +949,100 @@ src/dst の ne/nb/data を素の printf で出した。プロンプト 1 回で 
 `DMA_MAX_2D_STRIDE` は v81 で 24bit を許している点は残る穴
 （今回の形状では stride 16/12 で収まるが、他の形状で切り捨てが起きうる）。
 
+### 1.18 第9ラウンド: state 別 hash で入口を絞り、GDN は無罪と確定
+
+#### Step 0: state 別の hash 分離
+
+`KeysValues::layer_hashes()` と `Qwen35Decoder::state_hashes()` を足し、
+プロンプト直後に **k[0..7] / v[0..7] / delta[0..23] / conv[0..18]** を層別に hash した。
+同 seed 2 run の比較:
+
+```
+60 キー中 59 が不一致
+一致したのは conv[0] だけ（48cb3b0c19948e6c）
+```
+
+内訳: `cache` 1、`k` 8、`v` 8、`delta` 24、`conv` 18 がすべて不一致。
+
+#### conv[0] だけが一致する理由
+
+`build_rows` は層 0 から順に走る。層 0 は `linear_attention` なので `delta_mixer(0)` が最初:
+
+```cpp
+qkv  = mul_mat(ssm_in_qkv, x)                      // x = 埋め込み（決定的）
+rows = concat(conv_state[0]=zeros, qkv^T)          // 決定的
+g.copy(view_2d(rows, 3, channels, ...), conv_state) // CPY A
+```
+
+**`conv[0]` は GDN を一度も通らずに書かれる唯一の state** なので決定的。
+一方 `delta[0]` は `ggml_gated_delta_net()` の出力から書かれるので、
+そこが違えば `delta[0]` も違う。以降は層ごとに前の層の出力を入力にするため、
+**腐敗が全層へ伝播する**。
+
+#### NDEV=1 でも直らない
+
+`GGML_HEXAGON_NDEV=1`（単一セッション）で 2 run 測ると:
+
+```
+conv[0] : 48cb3b0c19948e6c  (4 run すべて同一)
+delta[0]: 0a6349ee5bdc93d9 / b41cd7378976e58f  (ndev=1)
+          6125167e93b42b54 / e3eadd2424d4b410  (ndev=2)
+```
+
+**マルチセッション分割は原因ではない。**
+
+#### GDN 単体 replay: 決定的かつ CPU と一致 = 無罪
+
+`htp-gdn-test` を書いて、haru と同じ形状（`S_v=128, H=32, n_tokens=1, n_seqs=1, K=1`）で
+`ggml_gated_delta_net()` だけを 5 回ずつ実行した:
+
+```
+CPU : 6ab79791dc3ec0b2 x5   DETERMINISTIC
+HTP : 46a0a77473289fe8 x5   DETERMINISTIC
+```
+
+両バックエンドとも**完全に決定的**。hash は違うが、要素ごとに比べると:
+
+| 要素 | CPU | HTP | 相対差 |
+|---|---|---|---|
+| [0] | +0.0804120675 | +0.0804120898 | 2.8e-07 |
+| [1] | -0.0594192371 | -0.0594192222 | 2.5e-07 |
+| [3] | -0.0883070678 | -0.0883070678 | 0 |
+| rms | 0.259030466 | 0.259030457 | 3.5e-08 |
+| max | 0.956314981 | 0.956315041 | 6e-08 |
+
+**差はすべて 1e-8 相対オーダー = f32 の累積順序差。**
+GDN は HTP で**正しく**、しかも**決定的**である。**GDN は無罪。**
+
+#### 第9ラウンドの結論
+
+| 項目 | 状態 |
+|---|---|
+| state 別 hash | 実装済み。59/60 が不一致、`conv[0]` だけ一致 |
+| `conv[0]` が一致する理由 | **GDN を通らない唯一の state** |
+| マルチセッション説 | **否定**（NDEV=1 でも不一致） |
+| GDN 単体 | **決定的かつ CPU と 1e-8 で一致 = 無罪** |
+| 非決定性の所在 | **GDN の周辺**（opbatch の順序、CPY と GDN の競合） |
+
+**GDN カーネル自体は正しく決定的**なので、残る容疑は
+「`state` を読む GDN と、その直後に同じ `state` へ書く CPY が
+同じ opbatch 内で競合する」構図である。`delta_mixer` は
+
+```cpp
+out = ggml_gated_delta_net(..., state, 1);   // state を読む
+g.copy(view_3d(out, ...), state);            // 同じ state に書く
+```
+
+の順で、CPY が非同期に走ると次の層の GDN が書きかけの state を読みうる。
+第6ラウンドで `set_tensor` に入れた `flush_sync()` はホスト側の書き込みだけを
+守っており、**opbatch 内の CPY→GDN の依存は守っていない**。
+
+#### 次の一手
+
+`delta_mixer` の `g.copy` の直後に明示的な同期を入れる（`GGML_HEXAGON_CPY_SAFE=1`
+のようなフラグ付きで）か、opbatch のバッチ境界を CPY の後で切る。
+それで `delta[0]` が決定的になれば因果が確定する。
+
 #### Phase C の前提が変わった点（重要）
 
 指示書には「幅 7 の conv は分解しても K=7 が 32 非倍数で CPU 回帰になる」とあるが、
