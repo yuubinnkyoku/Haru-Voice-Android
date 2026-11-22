@@ -850,6 +850,105 @@ KV キャッシュは HTP に置かれたままなので、この CPY は HTP �
 `dma_cpy_push_2d_chunked()` が stride を誤って解釈し、
 **バッファの不定な領域を読んでいる**ためと考えられる。
 
+### 1.17 第8ラウンド: shape の向きを訂正し、CPY が入口と確定
+
+#### 訂正1: shape の向きを読み違えていた
+
+第7ラウンドで「`3:8192` は ne[0]=8192」と書いたが、これは**誤り**だった。
+`htp_opformat::format_tensor_dims()` は `ne[0]:ne[1]` の順に出す:
+
+```cpp
+return snprintf(str, max_size, "%d:%d", (int) t->ne[0], (int) t->ne[1]);
+```
+
+したがって `3:8192` は **ne[0]=3, ne[1]=8192** である。この読み方なら全て整合する:
+
+- `ne[0]=3, nb[0]=4` → 行は 12 バイト
+- `dst nb[1]=12` → **ちょうど 12 = 3×4 なので dst は連続**
+- `src nb[1]=16` → 16 > 12 なので **src だけが 4 バイトの padding を持つ**
+
+第7ラウンドの「ne[0]=8192 なのに nb[1]=16」という矛盾は、単なる読み違いだった。
+
+#### 訂正2: `3:8192` は KV キャッシュではなく GDN の conv state
+
+`3 × 8192 × 4 = 98304` バイト。haru の次元と突き合わせると:
+
+```
+channels = 2 × linear_num_key_heads × linear_key_head_dim + linear_num_value_heads × linear_value_head_dim
+         = 2 × 16 × 128 + 32 × 128 = 4096 + 4096 = 8192
+conv state = [conv_width - 1, channels] = [3, 8192]
+```
+
+**GDN の conv state だった。** 該当コードは `qwen35-decoder.cpp`:
+
+```cpp
+ggml_tensor * rows = ggml_concat(c, conv_state, ggml_cont(c, ggml_transpose(c, qkv)), 0);
+g.copy(ggml_view_2d(c, rows, conv_width_ - 1, channels, rows->nb[1], (size_t) n * rows->nb[0]), conv_state);
+```
+
+`rows` は `[4, 8192]`（conv_state 3 行 + 新しい 1 行）で連続、`nb[1]=16`。
+その先頭 3 行を `conv_state`（`nb[1]=12`）へ写す。**src だけ padding を持つ**構図。
+
+#### Step 0 §1.2: CPY 出力の初めての直接比較 — 不一致
+
+`KeysValues::hash()` を足し、プロンプト実行直後にキャッシュ全体を host へ pull して
+FNV-1a で hash した。同 seed 2 run:
+
+```
+run 1: kv-hash rows 0..1 cache 7679b3bfe935c4cc
+run 2: kv-hash rows 0..1 cache b70fc8f0d5f59dff
+```
+
+**不一致。** これまで「CPY が入口」は状況証拠だったが、**CPY が書いた中身が
+run ごとに違うことが直接確認できた**。`noise` は両 run で同一
+（`3e780339facc7807`）なので、入力側は決定的である。
+
+#### Step 0 §1.1: 4 つの CPY の完全 shape
+
+`SPEECH_CPY_DUMP` を足して、`precompute_cpy_params()` が受け取る
+src/dst の ne/nb/data を素の printf で出した。プロンプト 1 回で 4 種類:
+
+| # | src ne / nb | dst ne / nb | 何か |
+|---|---|---|---|
+| A | `[3,8192]` nb `[4,16,131072,131072]` | `[3,8192]` nb `[4,12,98304,98304]` | GDN conv state |
+| B | `[128,128,32]` nb `[4,512,65536,2097152]` | 同左（完全一致） | GDN delta state |
+| C | `[256,1,4]` nb `[4,4096,1024,4096]` | `[256,1,4]` nb `[4,1024,2048,8192]` | KV キャッシュ k |
+| D | `[1,256,4]` nb `[4096,4,1024,4096]` | `[1,256,4]` nb `[4,8,2048,8192]` | KV キャッシュ v |
+
+（`src data=0x0` は `supports_op` の時点でまだ割り当てられていないため。異常ではない。）
+
+**A と B が GDN、C と D が KV キャッシュ。** 48 回の CPY はこの 4 種類の繰り返し。
+
+#### 静的解析: 4 つとも計算は正しく見える
+
+- **A**: `dma_cpy_sametype_sameshape_range` が `contiguous_outer` 経路に入り、
+  `dma_cpy_push_2d_chunked(dst, src, nb1=12, nb01=16, row_size=12, nrows=8192)`。
+  12 バイトを stride 16 から stride 12 へ 8192 行。**正しい**
+- **B**: src と dst の nb が完全一致なので `1D_CONTIG`。**正しい**
+- **C**: `ne00=256, nb00=4, nb0=4` → `run=256`、stride 4 == elem 4 なので連続 1024 バイト。**正しい**
+- **D**: `ne00=1` なので `run=1`、1 要素 4 バイトを stride 4096 から stride 4 へ。**正しい**
+
+`DEFINE_CPY_RESHAPE` の `dma_cpy_push_2d_chunked(..., ELEM_SIZE, run)` は
+`row_size` が `ELEM_SIZE` 固定だが、`run > 1` のときは stride == elem_size なので
+結果的に連続コピーになり正しい。**この 4 形状では発火しない。**
+
+#### 第8ラウンドの現状
+
+| 項目 | 状態 |
+|---|---|
+| shape の向き | **訂正済み**（`ne[0]:ne[1]` の順） |
+| `3:8192` の正体 | **GDN conv state**（KV キャッシュではない） |
+| CPY 出力の直接比較 | **不一致**（2 run で違う）。CPY が入口と確定 |
+| 4 つの CPY の shape | 取得済み（A/B が GDN、C/D が KV） |
+| 静的解析 | 4 つとも計算は正しい。**実測 replay が必要** |
+| 次の一手 | 実測スナップショットからの replay（§2）。特に A の `contiguous_outer` 経路 |
+
+**静的解析でバグが見つからない**ので、次は §2 の replay で実測するしかない。
+`dma_cpy_push_2d_chunked` の `dma_ring_push_single_2d` が
+`src_stride`/`dst_stride` を **16bit フィールド**に書く一方、
+`DMA_MAX_2D_STRIDE` は v81 で 24bit を許している点は残る穴
+（今回の形状では stride 16/12 で収まるが、他の形状で切り捨てが起きうる）。
+
 #### Phase C の前提が変わった点（重要）
 
 指示書には「幅 7 の conv は分解しても K=7 が 32 非倍数で CPU 回帰になる」とあるが、
