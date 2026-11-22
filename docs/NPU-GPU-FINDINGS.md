@@ -486,8 +486,99 @@ ggml のアロケータは入力と出力の寿命が重ならないので同じ
 | `x` の NaN | `first=0`。原因未確定 |
 | 再測定 | デバイスが offline になり中断。次回再開 |
 
-**次の一手**: 修正した測定で `noise` が常に同一 hash になることを確認し（そうなるはず）、
-`hidden` の非決定性を first-divergence で LM の node まで追う。
+### 1.13 第5ラウンド（続き）: 根本原因は LM の非決定性と確定
+
+#### `noise` は完全に決定的だった
+
+フレーム番号を出力に足して再測すると、`noise` の hash は**フレーム番号だけで決まる**ことが分かった:
+
+```
+frame 0  -> 3e780339facc7807
+frame 26 -> cc2d890fc27ff7bc
+frame 27 -> 353d1440d133ee71
+frame 28 -> 5a07a9cc850895cb
+frame 45 -> fbb08d252f3d27b6
+frame 46 -> 817e14d0c3802415
+frame 47 -> 86bd444b2bf94938
+```
+
+run 3 と run 4 は同じフレーム 45/46/47 で**同一の hash** を出した。RNG は正常。
+以前「run 間で違う」と見えたのは、NaN で早期終了した run の**最終フレームが違った**ためで、
+別々のフレームを比べていた。
+
+#### head のブロック単位トレースで overflow を特定
+
+`Head::build()` の各ブロック出力を trace に載せて 6 run 回した。5 run は完走、1 run で NaN。
+
+完走した run の hash（run 1〜5）:
+
+```
+proj     21cf9594b9cf1582  ← 5 run すべて同一
+blk0     1bb5b082ca98000a / d7b12c0487b0d19c / 75c57cccbf3fd0e4 / ...  ← 毎回違う
+blk1     7f7ea75c17d48f02 / 18c80ba8c76eafd1 / ...                     ← 毎回違う
+```
+
+**`proj`（= `latent_proj(noise)`）だけが 5/5 で同一。** `noise` が決定的なので正しい。
+`blk0` 以降が毎回違うのは、入力の `hidden` が毎回違うから。
+
+NaN になった run 6 の内訳:
+
+```
+proj     ok
+blk0     ok
+blk1     NAN  first=0  [0]=0xff800000 [1]=0x7f800000 [2]=0xff800000 [3]=0x7f800000
+blk2     NAN  first=0  [0]=0xffffffff [1]=0xffffffff [2]=0x7fffffff ...
+blk3     NAN
+tail0    ok   (cond 経路、独立)
+tail1    ok   (ada、独立)
+tail2    NAN  (velocity)
+tail3    NAN  (out = noise + velocity)
+```
+
+`blk1` の先頭 4 要素が **-inf, +inf, -inf, +inf の交互**。これは飽和ではなく**発散**で、
+ブロックが値を無限に増幅して float32 の範囲を超えたことを示す。
+`blk2` 以降は `inf - inf` などで NaN に変わる。
+
+#### 因果関係
+
+```
+LM (dialogue.rows) が HTP で非決定的
+   ↓ hidden が run ごとに違う
+head の入力が毎回違う
+   ↓ ある run では blk1 が発散する領域に入る
+x が inf → NaN
+   ↓
+latent が NaN → codec のデコードが NaN → API が停止
+```
+
+**head の overflow は結果であって原因ではない。** 根本原因は LM の非決定性。
+
+#### なぜ LM が非決定的なのか（未解決）
+
+`proj` が決定的で `hidden` が非決定的なので、非決定性は LM の計算の中にある。
+候補:
+
+1. **KV キャッシュの `CPY`** — `KeysValues::attend()` が `g.copy()` でキャッシュに書き込む。
+   HTP の `CPY` が非同期で、完了を待たずに次の op が読む可能性。
+2. **`GATED_DELTA_NET` の状態** — 状態テンソルを `CPY` で更新する箇所があり、同じ構図。
+3. **opbatch の同期** — 第4ラウンドで `supports_op` にバッファ検査を足したが、
+   `CPY` の完了順序は別問題。
+
+第2ラウンドで観測した「run 間でテキストが違う」もこれで説明できる。
+
+#### 第5ラウンドの結論
+
+| 項目 | 状態 |
+|---|---|
+| `noise` | **決定的**（フレーム番号で決まる）。RNG は正常 |
+| `proj` | **決定的**（5/5 同一 hash） |
+| `hidden` | **非決定的**（5/5 で違う）。LM 側の問題 |
+| `x` の NaN | `blk1` の発散。**LM 非決定性の結果** |
+| 根本原因 | **LM の HTP 非決定性**（KV キャッシュの CPY 同期が最有力） |
+
+**次の一手**: LM の first-divergence。同じ seed の 2 run で `dialogue.rows` の
+node 出力 hash を比べ、最初に分岐する node を特定する。`CPY` が候補なので、
+`KeysValues::attend()` の `g.copy()` の前後を重点的に見る。
 
 #### Phase C の前提が変わった点（重要）
 
