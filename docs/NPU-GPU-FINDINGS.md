@@ -645,6 +645,88 @@ syscall: 56 (openat) 0xffffff9c ...
 **次の一手**: デバイスを再起動してから、修正版で `hidden` の 5 run 安定性を測る。
 安定すれば Step 0 の port で決着。安定しなければ first-divergence に進む。
 
+### 1.15 第6ラウンド（続き）: flush 修正は効かず、KV レース説も否定
+
+#### デバイス復旧
+
+`/sdcard` の FUSE deadlock は `reboot` で解消した（`/system/bin/reboot` は
+`D` 状態のプロセスがいても通り、再起動後に `/sdcard` が応答するようになった）。
+
+#### flush 修正の効果: 無し
+
+`set_tensor_async` / `set_tensor_2d_async` に `flush_sync()` を足した版で
+`hidden` の hash を 5 run 測ると、**5/5 で違うまま**だった:
+
+```
+93bc007469b48577, 7c91c6063d533fbc, ad6aa241914bcee9, c4e5de11e9d54504, 070de5698d9ccb72
+```
+
+（うち 2 run は `latent` が NaN）
+
+修正自体は正しい（`get` 側と対称になった）が、**非決定性の原因ではなかった**。
+
+#### 決定的な切り分け: frame 0 で既に非決定的
+
+`--max-seconds 0.2`（1 フレームだけ）で回すと、**最初のフレームから** hash が違う:
+
+```
+proj   : 3ef7a79c191df284 x4   ← 4/4 同一
+hidden : f1a1c338e29aa708, a6e92f8edeac3ca8, cb445f91f7c61c56, bd2c5c44a205369e
+```
+
+`proj`（= `latent_proj(noise)`）は決定的なのに、`hidden`（LM の出力）は frame 0 で既に違う。
+
+**frame 0 には壊れるべき過去の KV キャッシュが無い。** 会話はプロンプト
+（`dialogue.rows`）→ frame 0 の順に走るので、非決定性はプロンプトのパスか
+最初のステップにある。**KV キャッシュの write/read レース説は否定された。**
+
+#### マルチセッション説も否定
+
+`GGML_HEXAGON_NDEV=1`（単一セッション）でも frame 0 の `hidden` は 4/4 で違った:
+
+```
+f9ec687d6e0f4019, 69bfbd037ff1c025, e15f023c1e5221d0, aa158d399599beac
+```
+
+複数セッションへの分割が原因ではない。
+
+#### CPU 参照を確定（重要）
+
+CPU で同じ条件（`--max-seconds 0.2`、seed 1）を 3 run 回すと、**3/3 で完全に同一**:
+
+```
+CPU hidden : da9f16819412530a x3
+```
+
+**HTP の 4 run はいずれも CPU の値と一致しない。** つまり HTP は
+「非決定的である」だけでなく「CPU と違う値になる」。正しさのゲートとして
+CPU 参照が使えるようになった。
+
+#### 何が残っているか
+
+| 説 | 判定 |
+|---|---|
+| KV キャッシュの CPY レース | **否定**（frame 0 で既に違う） |
+| `set_tensor` の flush 欠落 | **修正したが効果なし**（別の原因） |
+| マルチセッション分割 | **否定**（NDEV=1 でも違う） |
+| LM グラフ自体の非決定性 | **残存**。プロンプト（`dialogue.rows`、1786 node）が最有力 |
+
+#### 第6ラウンドの結論
+
+| 項目 | 状態 |
+|---|---|
+| Step 0 | **完了**。`set_tensor` の flush 欠落を発見・port（正しい修正だが原因ではなかった） |
+| KV レース説 | **否定** |
+| マルチセッション説 | **否定** |
+| CPU 参照 | **確定**（`da9f16819412530a`、3/3 同一） |
+| 非決定性の所在 | **LM グラフ内**。プロンプトのパスが最有力 |
+| NaN ゲート | 未達（5 run 中 2 run で NaN） |
+
+**次の一手**: `dialogue.rows`（プロンプト）の first-divergence。1786 node の
+出力 hash を 2 run で比べ、最初に分岐する node を特定する。frame 0 で既に違うので、
+**プロンプトの 1 回の実行の中で**分岐が起きている。`GATED_DELTA_NET` の状態初期化か、
+HMX/HVX カーネルのリダクション順序が候補。
+
 #### Phase C の前提が変わった点（重要）
 
 指示書には「幅 7 の conv は分解しても K=7 が 32 非倍数で CPU 回帰になる」とあるが、
