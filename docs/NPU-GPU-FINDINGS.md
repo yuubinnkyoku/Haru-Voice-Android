@@ -580,6 +580,71 @@ latent が NaN → codec のデコードが NaN → API が停止
 node 出力 hash を比べ、最初に分岐する node を特定する。`CPY` が候補なので、
 `KeysValues::attend()` の `g.copy()` の前後を重点的に見る。
 
+### 1.14 第6ラウンド: Step 0 で同期修正の欠落を発見（port 完了、実機検証は中断）
+
+#### Step 0: 同期系修正は haru 側ツリーに入っていなかった
+
+llama.cpp 側で入れた `8d96593b6`（同期 set_tensor 3 経路の opbatch sync）の signature を
+`ggml-hexagon.cpp` で探すと、**0 件**だった。`7df29a557` / `e30c6b7cd` の signature も無い。
+
+set_tensor の 3 経路を確認したところ、**非対称**が見つかった:
+
+| 経路 | `flush_sync()` |
+|---|---|
+| `get_tensor_async` | **あり** |
+| `get_tensor_2d_async` | **あり** |
+| `set_tensor_async` | **なし** ← 欠落 |
+| `set_tensor_2d_async` | **なし** ← 欠落 |
+| `host_buffer_set_tensor` | 不要（ホストメモリへの memcpy のみ） |
+
+`get` 側だけがキューを drain していて、`set` 側は drain していない。
+これはまさに `8d96593b6` が直したものと同型で、**本ラウンドの候補①（KV キャッシュの CPY）と
+同じ構図**である。
+
+#### 何が起きていたか
+
+`set_tensor_async` はホスト側のマップ済みバッファに `memcpy` する。DSP 側のバッチが
+まだ走っている間に書くと、**走行中のバッチが新しいバイト列を読む**。会話の KV キャッシュや
+Gated DeltaNet の状態は「前のバッチが読み、次のバッチが書く」テンソルなので、
+ここで混ざると run ごとに違う値になる。第5ラウンドで観測した `hidden` の非決定性と整合する。
+
+#### 修正（port）
+
+`set_tensor_async` と `set_tensor_2d_async` の先頭に `sess->flush_sync()` と
+エラーチェックを足した（`get` 側と同じ形）。これで書き込みは走行中のバッチが終わってから
+行われる。
+
+#### 実機検証は中断（デバイス側の障害）
+
+修正をビルドして実機で 5 run 測ろうとしたところ、**`/sdcard` の FUSE が deadlock** した。
+
+```
+PID 470  STAT D  speech-b
+wchan: d_alloc_parallel
+syscall: 56 (openat) 0xffffff9c ...
+```
+
+`openat` で `D`（uninterruptible sleep）状態のまま固着し、`kill -9` も効かない。
+`/data` は応答するが `/sdcard` への `ls` が返らない。モデルは `/sdcard` 上にあるので、
+以降の測定が一切できない。**デバイスの再起動が必要**。
+
+これは今回の修正が原因ではない（プロセスはモデルを開く前、`openat` の段階で固まっており、
+`/proc/470/fd` にモデルの fd が無い）。FUSE デーモンとカーネルの dentry ロックの問題。
+
+#### 第6ラウンドの現状
+
+| 項目 | 状態 |
+|---|---|
+| Step 0（同期修正の有無） | **欠落を発見**。`set_tensor_async` / `set_tensor_2d_async` に `flush_sync()` が無い |
+| port | **完了**（`get` 側と同じ形にした） |
+| 実機検証 | **中断**。`/sdcard` の FUSE deadlock でデバイス再起動待ち |
+| first-divergence | 未実施（Step 0 で原因候補が絞れたため優先度は下がった） |
+| barrier 実験 3 種 | 未実施 |
+| NaN ゲート 10 run | 未実施 |
+
+**次の一手**: デバイスを再起動してから、修正版で `hidden` の 5 run 安定性を測る。
+安定すれば Step 0 の port で決着。安定しなければ first-divergence に進む。
+
 #### Phase C の前提が変わった点（重要）
 
 指示書には「幅 7 の conv は分解しても K=7 が 32 非倍数で CPU 回帰になる」とあるが、
