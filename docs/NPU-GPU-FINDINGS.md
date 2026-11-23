@@ -1423,6 +1423,124 @@ execute-op MUL_MAT|leaf_0 x leaf_1 -> node_0|2560:32 x 2560:1 -> 32:1|q8_0 x f32
 `valid_rows` と `ct_start`/`ct_end` を DSP 側でログに出すのが最短。
 `FARF` は DSP のログなので、`GGML_HEXAGON_VERBOSE` とは別経路で確認する必要がある。
 
+### 1.23 第14ラウンド: Q8_0 のタイルは 1088 ではなく 1152 だった
+
+#### Step 0: canary テストで「未書き込み」を否定
+
+第13ラウンドの仮説（出力が書かれていない）を潰すため、MUL_MAT の前に dst を
+`12345.0` で埋めて実行後に読み返した:
+
+```
+CPU : canary untouched 0 of 32, written 32, non-finite 0
+HTP : canary untouched 0 of 32, written 32, non-finite 31
+      got nan nan nan nan nan nan nan -nan
+      activation readback 2560/2560 are 1.0
+```
+
+**カーネルは出力を書いている。** 未書き込みではない。活性化も正しく届いている。
+つまり**計算結果が NaN** である。
+
+#### K 依存性が決定的だった
+
+K を変えて NaN の個数を数えた:
+
+| K | non-finite |
+|---|---|
+| 32 | **0** |
+| 64 | 1 |
+| 128 | 2 |
+| 256 | 10 |
+| 512 | 15 |
+| 1024 | 25 |
+| 2560 | 31 |
+
+**K=32（タイル 1 個）だけ正常で、K が増えると壊れる。** タイル反復のバグである。
+
+#### テストハーネスの誤りを発見
+
+`ggml_backend_buffer_set_usage(WEIGHTS)` を呼んでいなかったため、
+repack が走らず生の Q8_0 ブロックが tiled として読まれていた。
+`speech.cpp` は `model-file.cpp:272` でこれを設定している。
+ハーネス側を直したところ、次のエラーが出た:
+
+```
+ggml_tallocr_alloc: not enough space in the buffer to allocate leaf_0
+  (needed 1152, available 1088)
+```
+
+**これが直接証拠だった。** バックエンドは Q8_0 のタイルに **1152 バイト**を要求するが、
+`ggml_nbytes()` は **1088** を返す。
+
+#### 真のバグ: タイルは aligned サイズを占める
+
+Q8_0 のタイルは `1024 (qs) + 64 (32 scales) = 1088` バイトだが、
+**DSP は scale を `hvx_vmem(tile_src + 1024)` で 128 バイト読み取る**。
+そのためタイルは **1152 バイト**（1024 + 128）を占める。
+
+`HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q8_0 = 1152` が正しい値で、
+`HTP_MM_WEIGHT_TILE_SIZE_Q8_0 = 1088` は「パック時のペイロード」に過ぎない。
+ところが 4 箇所が 1088 のままだった:
+
+| 箇所 | 修正前 | 修正後 |
+|---|---|---|
+| `ggml_hexagon_tiled_row_size()` | Q8_0 の分岐なし → `(ne0/32)*34` | `(ne0/32)*(1152/32)` = `(ne0/32)*36` |
+| `repack_q8_0_tiled()` の `tile_size` | `TILE_SIZE_Q8_0` (1088) | `ALIGNED_TILE_SIZE_Q8_0` (1152) |
+| `MATMUL_2D/4D/NX_2D_REPACKED_IMPL(q8_0, ...)` | 1088 | 1152 |
+| `MATVEC_2D_REPACKED_IMPL(q8_0, ...)` | 1088 | 1152 |
+
+**`MATMUL_4D_REPACKED_IMPL` の修正漏れ**が特に重要だった。本番の LM は
+`n_tokens=1` でも 4D バッチ経路を通るため、2D/MATVEC だけ直しても効かなかった。
+
+#### 修正後: 単体テストは全 shape で正常
+
+```
+K=32   M=32 : max_rel 6.1e-05, non-finite 0
+K=2560 M=32 : max_rel 6.3e-05, non-finite 0
+K=2560 M=1  : max_rel 6.1e-05, non-finite 0
+```
+
+`max_rel` 6e-5 は Q8_0 の量子化誤差として妥当。**NaN は 0。**
+
+#### 残る問題: 本番 LM の `qkv` がまだ不一致
+
+修正後も本番の LM では:
+
+```
+HTP qkv : -1.73718166 -0.42808938 -0.0300799906 -2.00579
+CPU qkv : -1.81159043 -0.406986237 -0.0383850336 -1.99765396
+```
+
+**修正前と全く同じ値**で、変化していない。単体テストは通るのに本番だけ通らない。
+
+確認できたこと:
+
+- `repack` は走っている（209 個の Q8_0 テンソル、`tile=1152` の trace あり）
+- repack 後のタイル内容は正しい（`qs[0..3]=255,23,253,50`、`scale[0..3]=7394,7007,6870,7386`）
+- `ssm_in_qkv` の MUL_MAT は `kernel=6`（`HTP_MM_KERNEL_HVX_QUANT_BLOCK`）
+- skel は更新済み（local と device の sha256 が一致 `2d48fb8d…`）
+- バッファサイズは `get_alloc_size` で 23592960 = `matrix_size` と一致
+
+**本番だけ通らない**ので、単体テストと本番の差（モデルファイルの分割読み込み、
+`shadow_buf` 経路、`needs_repack` の順序）のどこかにまだ穴がある。
+
+#### 第14ラウンドの結論
+
+| 項目 | 状態 |
+|---|---|
+| canary テスト | **出力は書かれている**（未書き込み説を否定） |
+| K 依存性 | **K=32 のみ正常**、K が増えると壊れる |
+| 真のバグ | **Q8_0 のタイルは 1152 バイト**（1088 ではない） |
+| 修正 | 4 箇所を 1152 に統一（`MATMUL_4D` の漏れが重要） |
+| 単体テスト | **全 shape で正常**（`max_rel` 6e-5、NaN 0） |
+| 本番 LM | **まだ不一致**（`qkv` が修正前と同一値） |
+
+**次の一手**: 単体テストと本番の差を詰める。最有力は `shadow_buf` 経路
+（`model-file.cpp` は 16MB ずつ `set_tensor` するので、`ssm_in_qkv` の
+22MB は 2 回に分かれる）。`shadow_size >= ggml_nbytes` の判定は正しいが、
+`repack` に渡す `size` が `shadow_buf.size()`（= `ggml_nbytes`）なので
+`end_slice` の計算は合うはず。実測で `repack` 直後の `t->data` を
+読み返し、DSP が読む値と一致するかを確認する。
+
 #### Phase C の前提が変わった点（重要）
 
 指示書には「幅 7 の conv は分解しても K=7 が 32 非倍数で CPU 回帰になる」とあるが、
