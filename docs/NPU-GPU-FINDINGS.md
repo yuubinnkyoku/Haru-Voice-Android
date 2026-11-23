@@ -1043,6 +1043,110 @@ g.copy(view_3d(out, ...), state);            // 同じ state に書く
 のようなフラグ付きで）か、opbatch のバッチ境界を CPY の後で切る。
 それで `delta[0]` が決定的になれば因果が確定する。
 
+### 1.19 第10ラウンド: CPY のバッチ境界で決定性が直る（因果確定）
+
+#### Step 0: op 単位の chain では再現しない
+
+`htp-gdn-chain` を書いて、haru と同じ構図を 1 グラフに組んだ:
+
+```
+state = zeros
+out1 = gdn(state, x1)
+copy(view_3d(out1, ...) -> state)     // haru の delta_mixer と同じ
+out2 = gdn(state, x2)
+```
+
+5 run ずつ実行:
+
+```
+CPU : out2 2306487b45a2a0b0 x5, state 447e16649fac2e0d x5   DETERMINISTIC
+HTP : out2 fc91edee97ceef6e x5, state 447e16649fac2e0d x5   DETERMINISTIC
+```
+
+**両バックエンドとも決定的。しかも `state` の hash は CPU と HTP で完全一致**
+（`447e16649fac2e0d`）。`out2` が違うのは GDN 自身の f32 累積順序差（第9ラウンドで
+1e-8 と実証済み）。
+
+**op 3 つの chain では race は再現しない。** 実グラフは 32 層 × 約 10 op = 300 op 超を
+1 つの opbatch（最大 1280 op）に積むので、その規模が要る。
+
+#### Step 0.4: 1 行でも既に非決定的
+
+`--max-seconds 0.2`（`rows 0..1`、1 行だけ）でも `delta[0]` は run ごとに違った:
+
+```
+secs=0.2 run1: delta[0] b9d35dada02336d9
+secs=0.2 run2: delta[0] 2ec4604c6c64cef8
+secs=0.4 run1: delta[0] 902a1b21893f3609
+secs=0.4 run2: delta[0] 991697b680b002db
+conv[0]: 48cb3b0c19948e6c in ALL FOUR  ← canary 保持
+```
+
+**トークン間のレースではない。** 1 行の rows グラフの中で既に起きている。
+
+#### Step 1: CPY の後にバッチ境界を切ると直る（因果確定）
+
+`enqueue_op()` に `SPEECH_CPY_BARRIER` を足し、CPY を積んだ直後に `flush_async()` で
+バッチを切るようにした。ON/OFF の対比:
+
+```
+barrier=off run 1: cache 863f8c5f66b3f9c3  delta[0] 840793ee89fd38ef
+barrier=off run 2: cache 7d7966cbd965c2f8  delta[0] b2e53c548479e2ed   ← 不一致
+barrier=on  run 1: cache 4a37228a10f8ccf4  delta[0] 31bc8e07820c5997
+barrier=on  run 2: cache 4a37228a10f8ccf4  delta[0] 31bc8e07820c5997   ← 一致
+conv[0]: 48cb3b0c19948e6c in ALL FOUR  ← canary 保持
+```
+
+**因果確定。** CPY と、その出力を読む後続 op が同じ opbatch に入り、
+DSP が順序を守らずに実行していた。バッチ境界を切れば直る。
+
+これは第5ラウンド以降の全症状（`hidden` の非決定性、`latent` の NaN、
+run 間のテキスト不一致）の**単一の根本原因**である。
+
+#### Step 3: ゲート
+
+| ゲート | 結果 |
+|---|---|
+| 1. 決定性（5 run） | **PASS** — `hidden` が 5/5 で `22b4393e8dd566fd`、cache も 5/5 一致 |
+| 2. CPU 対比較 | **FAIL** — `hidden` が CPU の `da9f16819412530a` と全く違う |
+| 3. NaN（10 run） | **PASS** — 0/10 |
+| 4. 速度 | barrier ON で 33.5 s（CPU 20 s より遅い） |
+
+#### Gate 2 の失敗は「2 つ目のバグ」
+
+`hidden` の先頭 16 要素を CPU と比べると、**O(1) の桁で違う**:
+
+| index | HTP | CPU |
+|---|---|---|
+| 0 | -12.837484 | +22.542461 |
+| 1 | +3.976998 | +1.235550 |
+| 5 | +5.540888 | +1.592222 |
+| 13 | -5.034229 | +5.090177 |
+
+f32 の累積順序差（1e-8）ではなく、**実質的に別の計算結果**である。
+
+**これは初めてのクリーンな比較**だった。第5〜9ラウンドは HTP が非決定的だったので、
+「CPU と違う」ことと「run ごとに違う」ことを分離できなかった。決定性を直したことで、
+**HTP の答えがそもそも間違っている**ことが初めて見えた。
+
+#### 第10ラウンドの結論
+
+| 項目 | 状態 |
+|---|---|
+| op 単位の chain | 決定的。`state` は CPU と bit 一致 |
+| 1 行でも非決定的 | **トークン間レースではない** |
+| CPY バッチ境界 | **因果確定**（ON で 2 run 一致、OFF で不一致） |
+| canary `conv[0]` | 4/4 で保持 |
+| Gate 1（決定性） | **PASS** |
+| Gate 2（CPU 対比較） | **FAIL** — 2 つ目のバグ |
+| Gate 3（NaN） | **PASS** |
+| Gate 4（速度） | barrier ON で 33.5 s（CPU 20 s より遅い） |
+
+**決定性は直ったが、正しさは別問題として残る。** 次は「HTP の LM が CPU と
+O(1) で違う」原因を追う必要がある。GDN 単体は 1e-8 で一致していたので、
+LM の他の op（`MUL_MAT` の量子化経路、`SSM_CONV`、`ROPE`、`SOFT_MAX` など）か、
+あるいは state の初期化・読み出しのどこかが疑わしい。
+
 #### Phase C の前提が変わった点（重要）
 
 指示書には「幅 7 の conv は分解しても K=7 が 32 非倍数で CPU 回帰になる」とあるが、
