@@ -36,7 +36,7 @@ public class MainActivity extends Activity {
     File speechBin, timingBin;
 
     EditText modelEdit, questionEdit, refEdit, nameEdit, personaEdit;
-    Button btnQuant, btnDl, btnTalk, btnPlay, btnTime, btnStop;
+    Button btnQuant, btnDl, btnTalk, btnPlay, btnTime, btnStop, btnConv;
     TextView statusView, logView;
     ScrollView logScroll;
     StringBuilder logBuf = new StringBuilder();
@@ -229,6 +229,13 @@ public class MainActivity extends Activity {
         });
         root.addView(btnStop);
 
+        // 0.3.0: 会話モード (worker プロトコルによるターン制対話)
+        btnConv = mkButton("会話モードを開く (0.3.0)");
+        btnConv.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { onConvClicked(); }
+        });
+        root.addView(btnConv);
+
         TextView logTitle = new TextView(this);
         logTitle.setText("ログ");
         logTitle.setTextColor(Color.LTGRAY);
@@ -350,6 +357,27 @@ public class MainActivity extends Activity {
                 btnPlay.setEnabled(!b && replyFile.exists());
             }
         });
+    }
+
+    // ================= 会話モード (0.3.0) =================
+
+    void onConvClicked() {
+        File model = new File(modelEdit.getText().toString().trim());
+        if (!model.exists() || model.length() < 100000000L) {
+            appendLog("エラー: モデルファイルが見つかりません: " + model.getAbsolutePath());
+            return;
+        }
+        String name = nameEdit.getText().toString().trim();
+        if (name.isEmpty()) { appendLog("エラー: 名前を入れてください"); return; }
+        String ref = refEdit.getText().toString().trim();
+        Intent i = new Intent(this, ConversationActivity.class);
+        i.putExtra("model", model.getAbsolutePath());
+        i.putExtra("name", name);
+        i.putExtra("persona", personaEdit.getText().toString().trim());
+        File rf = ref.isEmpty() ? null : resolveInput(ref);
+        if (rf != null) i.putExtra("voice_ref", rf.getAbsolutePath());
+        else if (!ref.isEmpty()) appendLog("参照ボイスが見つからないためデフォルトボイスで開きます: " + ref);
+        startActivity(i);
     }
 
     File resolveInput(String s) {
