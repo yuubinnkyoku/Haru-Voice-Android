@@ -230,7 +230,7 @@ public class MainActivity extends Activity {
         root.addView(btnStop);
 
         // 0.3.0: 会話モード (worker プロトコルによるターン制対話)
-        btnConv = mkButton("会話モードを開く (0.3.0)");
+        btnConv = mkButton("会話モードを開く (0.3.1)");
         btnConv.setOnClickListener(new View.OnClickListener() {
             @Override public void onClick(View v) { onConvClicked(); }
         });

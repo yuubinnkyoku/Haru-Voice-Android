@@ -1,0 +1,6 @@
+obj/
+dexout/
+base.apk
+aligned.apk
+*.apk
+*.idsig
