@@ -106,6 +106,8 @@ public class WorkerClient {
                 L.onEnd(o.optString("id"), o.optInt("frames", -1), o.optInt("samples", -1));
             } else if ("error".equals(type)) {
                 L.onError(o.optString("id"), o.optString("code"), o.optString("message", line));
+            } else if ("cancelled".equals(type)) {
+                L.onLog("[cancelled] " + o.optString("id"));
             } else if ("fatal".equals(type)) {
                 L.onFatal(o.optString("message", line));
             } else {
@@ -146,6 +148,18 @@ public class WorkerClient {
     public void hangUp(String id) throws IOException, JSONException {
         JSONObject o = new JSONObject();
         o.put("type", "hang_up");
+        o.put("id", id);
+        send(o);
+    }
+
+    /**
+     * 会話を次フレームで打ち切る。
+     * hang_up は「送った音声を最後まで聞いてから終える」ので計算は止まらず、
+     * 打ち切ったはずのターンが終わるまで次の会話が詰まる。cancel は次フレームで止まる。
+     */
+    public void cancel(String id) throws IOException, JSONException {
+        JSONObject o = new JSONObject();
+        o.put("type", "cancel");
         o.put("id", id);
         send(o);
     }

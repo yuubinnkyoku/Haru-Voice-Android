@@ -24,7 +24,7 @@ import java.io.File;
 import java.util.ArrayList;
 
 /**
- * 会話モード (0.3.1)。
+ * 会話モード (0.3.2)。
  *
  * 0.3.0 からの変更:
  *  - ready 後に捨て会話 (id=w0) で沈黙 3 秒を計算させてキャッシュを暖機し、
@@ -96,7 +96,7 @@ public class ConversationActivity extends Activity implements WorkerClient.Liste
         if (workDir == null) workDir = getFilesDir();
         buildUi();
         getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        appendLog("会話モード (0.3.1) 開始");
+        appendLog("会話モード (0.3.2) 開始");
         appendLog("モデル: " + modelPath);
         startWorker();
     }
@@ -418,8 +418,8 @@ public class ConversationActivity extends Activity implements WorkerClient.Liste
 
     /** 応答待ちへの割り込み: 現会話を捨てて新しい会話を開始する (文脈はリセットされる) */
     void bargeIn() {
-        appendLog("割り込み: Haru の応答待ちを打ち切り、新しい会話にします (文脈はリセット)");
-        try { wk.hangUp(convId); } catch (Exception e) { appendLog("hang_up 失敗: " + e); }
+        appendLog("割り込み: cancel で応答計算を止め、新しい会話にします (文脈はリセット)");
+        try { wk.cancel(convId); } catch (Exception e) { appendLog("cancel 失敗: " + e); }
         convNum++;
         convId = "c" + convNum;
         convSeq = 0;
@@ -636,7 +636,7 @@ public class ConversationActivity extends Activity implements WorkerClient.Liste
         if (warming) { toast("暖機中はできません"); return; }
         if (st == St.RECORDING) { toast("録音中はできません"); return; }
         if (st == St.PLAYING) { toast("再生中はできません"); return; }
-        try { wk.hangUp(convId); } catch (Exception e) { appendLog("hang_up 失敗: " + e); }
+        try { wk.cancel(convId); } catch (Exception e) { appendLog("cancel 失敗: " + e); }
         convNum++;
         convId = "c" + convNum;
         convSeq = 0;
